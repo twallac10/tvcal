@@ -284,7 +284,13 @@
     button.addEventListener("click", async () => {
       button.disabled = true;
       button.textContent = "Adding…";
-      await addShow(show.id, show.name);
+      const ok = await addShow(show.id, show.name);
+      if (ok) {
+        button.textContent = "Added";
+      } else {
+        button.disabled = false;
+        button.textContent = "+ Add";
+      }
     });
     card.appendChild(button);
 
@@ -292,12 +298,15 @@
   }
 
   async function addShow(id, name) {
-    await fetch(`/watchlist?list=${encodeURIComponent(state.token)}`, {
+    const res = await fetch(`/watchlist?list=${encodeURIComponent(state.token)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ show_id: id, show_name: name }),
     });
-    await loadWatchlist();
+    if (res.ok) {
+      await loadWatchlist();
+    }
+    return res.ok;
   }
 
   async function removeShow(id) {
