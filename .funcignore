@@ -1,0 +1,11 @@
+.git*
+.vscode
+__pycache__/
+tests/
+.pytest_cache/
+local.settings.json
+local.settings.json.example
+.venv/
+venv/
+requirements-dev.txt
+README.md

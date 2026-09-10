@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TV Cal</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f7f8;
+    --surface: #ffffff;
+    --border: #e2e2e5;
+    --text: #1b1b1f;
+    --text-muted: #6b6b73;
+    --accent: #4f5bd5;
+    --accent-text: #ffffff;
+    --danger: #c4453a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #131316;
+      --surface: #1c1c21;
+      --border: #2e2e34;
+      --text: #f2f2f4;
+      --text-muted: #9a9aa2;
+      --accent: #7c86f0;
+      --accent-text: #14141a;
+      --danger: #e07a72;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px 16px 64px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 780px; margin: 0 auto; }
+  header { margin-bottom: 28px; }
+  h1 { margin: 0 0 4px; font-size: 1.6rem; }
+  header p { margin: 0; color: var(--text-muted); }
+  section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 20px;
+  }
+  h2 { margin: 0 0 14px; font-size: 1.05rem; }
+  form { display: flex; gap: 8px; }
+  input[type="search"], input[type="text"] {
+    flex: 1;
+    min-width: 0;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 0.95rem;
+  }
+  button {
+    padding: 10px 16px;
+    border: none;
+    border-radius: 8px;
+    background: var(--accent);
+    color: var(--accent-text);
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  button:disabled { opacity: 0.6; cursor: default; }
+  button.remove-btn, button.secondary {
+    background: transparent;
+    color: var(--danger);
+    border: 1px solid var(--border);
+  }
+  button.secondary { color: var(--text); }
+  .empty { color: var(--text-muted); margin: 0; }
+  #search-results {
+    display: grid;
+    gap: 10px;
+    margin-top: 14px;
+  }
+  .show-card {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+  .show-card img {
+    width: 46px;
+    height: 64px;
+    object-fit: cover;
+    border-radius: 4px;
+    background: var(--bg);
+    flex-shrink: 0;
+  }
+  .show-info { flex: 1; min-width: 0; }
+  .show-info h3 { margin: 0; font-size: 0.98rem; }
+  .show-info p { margin: 2px 0 0; font-size: 0.85rem; color: var(--text-muted); }
+  #watchlist-items {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 8px;
+  }
+  .watchlist-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 0.95rem;
+  }
+  .feed-row { display: flex; gap: 8px; }
+  .feed-row input { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.85rem; }
+  .hint { color: var(--text-muted); font-size: 0.85rem; margin: 10px 0 0; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>TV Cal</h1>
+    <p>Search TV shows, build a watchlist, subscribe to one calendar feed.</p>
+  </header>
+
+  <section id="search">
+    <h2>Find a show</h2>
+    <form id="search-form">
+      <input type="search" id="search-input" placeholder="Search by title..." autocomplete="off" required>
+      <button type="submit">Search</button>
+    </form>
+    <div id="search-results"></div>
+  </section>
+
+  <section id="watchlist">
+    <h2>My watchlist</h2>
+    <ul id="watchlist-items"></ul>
+  </section>
+
+  <section id="feed">
+    <h2>Calendar subscription</h2>
+    <div class="feed-row">
+      <input type="text" id="feed-url" readonly>
+      <button type="button" id="copy-btn" class="secondary">Copy</button>
+    </div>
+    <p class="hint">Paste this URL into Google Calendar, Apple Calendar, or Outlook as a subscription (not a one-time import). It always reflects your current watchlist. This link is read-only -- anyone who has it can see your episode schedule but can't change your watchlist.</p>
+  </section>
+</main>
+
+<script>
+  const state = { token: null, feedToken: null, watchlist: [] };
+
+  function getOrCreateToken() {
+    const url = new URL(location.href);
+    let token = url.searchParams.get("list") || localStorage.getItem("tvcal_list_token");
+    if (!token) {
+      token = crypto.randomUUID();
+    }
+    localStorage.setItem("tvcal_list_token", token);
+    url.searchParams.set("list", token);
+    history.replaceState(null, "", url);
+    return token;
+  }
+
+  function isInWatchlist(id) {
+    return state.watchlist.some((show) => show.id === id);
+  }
+
+  async function loadWatchlist() {
+    const res = await fetch(`/watchlist?list=${encodeURIComponent(state.token)}`);
+    state.watchlist = res.ok ? await res.json() : [];
+    renderWatchlist();
+
+    if (!state.feedToken) {
+      await loadFeedToken();
+    } else {
+      renderFeedUrl();
+    }
+  }
+
+  async function loadFeedToken() {
+    const res = await fetch(`/watchlist/feed-token?list=${encodeURIComponent(state.token)}`);
+    if (res.ok) {
+      state.feedToken = (await res.json()).feed_token;
+    }
+    renderFeedUrl();
+  }
+
+  function renderFeedUrl() {
+    document.getElementById("feed-url").value = state.feedToken
+      ? `${location.origin}/calendar.ics?feed=${encodeURIComponent(state.feedToken)}`
+      : "";
+  }
+
+  function renderWatchlist() {
+    const list = document.getElementById("watchlist-items");
+    list.innerHTML = "";
+
+    if (state.watchlist.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "empty";
+      empty.textContent = "No shows yet. Search above and add some.";
+      list.appendChild(empty);
+      return;
+    }
+
+    for (const show of state.watchlist) {
+      const item = document.createElement("li");
+      item.className = "watchlist-item";
+
+      const name = document.createElement("span");
+      name.textContent = show.name;
+      item.appendChild(name);
+
+      const removeBtn = document.createElement("button");
+      removeBtn.textContent = "Remove";
+      removeBtn.className = "remove-btn";
+      removeBtn.addEventListener("click", () => removeShow(show.id));
+      item.appendChild(removeBtn);
+
+      list.appendChild(item);
+    }
+  }
+
+  async function search(query) {
+    const res = await fetch(`/shows/search?q=${encodeURIComponent(query)}`);
+    renderResults(res.ok ? await res.json() : []);
+  }
+
+  function renderResults(results) {
+    const container = document.getElementById("search-results");
+    container.innerHTML = "";
+
+    if (results.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "empty";
+      empty.textContent = "No matches.";
+      container.appendChild(empty);
+      return;
+    }
+
+    for (const show of results) {
+      container.appendChild(buildShowCard(show));
+    }
+  }
+
+  function buildShowCard(show) {
+    const card = document.createElement("div");
+    card.className = "show-card";
+
+    if (show.image) {
+      const img = document.createElement("img");
+      img.src = show.image;
+      img.alt = "";
+      img.addEventListener("error", () => { img.style.display = "none"; });
+      card.appendChild(img);
+    }
+
+    const info = document.createElement("div");
+    info.className = "show-info";
+
+    const title = document.createElement("h3");
+    title.textContent = show.name;
+    info.appendChild(title);
+
+    const meta = document.createElement("p");
+    const year = show.premiered ? show.premiered.slice(0, 4) : "";
+    meta.textContent = [show.network, year].filter(Boolean).join(" · ");
+    info.appendChild(meta);
+
+    card.appendChild(info);
+
+    const button = document.createElement("button");
+    const added = isInWatchlist(show.id);
+    button.disabled = added;
+    button.textContent = added ? "Added" : "+ Add";
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      button.textContent = "Adding…";
+      await addShow(show.id, show.name);
+    });
+    card.appendChild(button);
+
+    return card;
+  }
+
+  async function addShow(id, name) {
+    await fetch(`/watchlist?list=${encodeURIComponent(state.token)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ show_id: id, show_name: name }),
+    });
+    await loadWatchlist();
+  }
+
+  async function removeShow(id) {
+    await fetch(`/watchlist/${id}?list=${encodeURIComponent(state.token)}`, { method: "DELETE" });
+    await loadWatchlist();
+  }
+
+  document.getElementById("search-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const query = document.getElementById("search-input").value.trim();
+    if (query) search(query);
+  });
+
+  document.getElementById("copy-btn").addEventListener("click", async () => {
+    const input = document.getElementById("feed-url");
+    input.select();
+    try {
+      await navigator.clipboard.writeText(input.value);
+    } catch (err) {
+      document.execCommand("copy");
+    }
+    const btn = document.getElementById("copy-btn");
+    const original = btn.textContent;
+    btn.textContent = "Copied!";
+    setTimeout(() => { btn.textContent = original; }, 1500);
+  });
+
+  state.token = getOrCreateToken();
+  loadWatchlist();
+</script>
+</body>
+</html>
