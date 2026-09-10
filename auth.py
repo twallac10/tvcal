@@ -115,7 +115,12 @@ def _sign(payload: str) -> str:
 
 def create_session_cookie(username: str) -> str:
     """Return a Set-Cookie header value establishing a new session for `username`."""
-    payload = f"{username}:{_now() + SESSION_LIFETIME_SECONDS}"
+    # "." rather than ":" between username and expiry: Azure Functions'
+    # underlying host re-serializes a raw Set-Cookie header through its own
+    # .NET cookie-writer, which percent-encodes ":" (and anything else
+    # outside the URI "unreserved" set) but leaves "." untouched -- and our
+    # server-side parser below never URL-decodes the value it reads back.
+    payload = f"{username}.{_now() + SESSION_LIFETIME_SECONDS}"
     token = _sign(payload)
     return (
         f"{COOKIE_NAME}={token}; Path=/; HttpOnly; Secure; SameSite=Strict; "
@@ -143,11 +148,13 @@ def _parse_session_cookie(req: func.HttpRequest) -> str | None:
     """Return the session's username if the cookie is present, well-formed,
     correctly signed, and unexpired -- otherwise None."""
     token = _extract_cookie(req)
-    if not token or "." not in token:
+    if not token:
         return None
 
-    payload, _, signature = token.rpartition(".")
-    username, sep, expiry_str = payload.partition(":")
+    payload, sep, signature = token.rpartition(".")
+    if not sep:
+        return None
+    username, sep, expiry_str = payload.rpartition(".")
     if not sep:
         return None
     try:

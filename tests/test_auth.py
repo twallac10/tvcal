@@ -1,7 +1,11 @@
+import string
+
 import pytest
 
 import auth
 import storage
+
+_URI_UNRESERVED = frozenset(string.ascii_letters + string.digits + "-._~")
 
 # conftest.py's autouse bypass_auth fixture stubs out auth.is_authenticated
 # and auth.get_username for every test in the suite (most tests exercise
@@ -56,7 +60,7 @@ def _request_with_cookie(cookie_header=None):
 
 
 def _cookie_token(set_cookie_header):
-    # e.g. "tvcal_session=<user>:<expiry>.<sig>; Path=/; HttpOnly; ..." -> "<user>:<expiry>.<sig>"
+    # e.g. "tvcal_session=<user>.<expiry>.<sig>; Path=/; HttpOnly; ..." -> "<user>.<expiry>.<sig>"
     return set_cookie_header.split(";")[0].split("=", 1)[1]
 
 
@@ -137,6 +141,18 @@ def test_check_signup_code_raises_when_unconfigured(monkeypatch):
 
 
 # -- session cookie -------------------------------------------------------
+
+
+def test_session_cookie_value_contains_only_uri_unreserved_characters():
+    # Azure Functions' host re-serializes Set-Cookie through its own .NET
+    # cookie writer, which percent-encodes anything outside the URI
+    # "unreserved" set (letters, digits, -._~) -- e.g. ":" silently became
+    # "%3A" in production, and our own parser never URL-decodes what it
+    # reads back, so a session could be issued (200/204) yet never actually
+    # authenticate on any later request. Any future change to the cookie
+    # format must keep every character in this safe set.
+    token = _cookie_token(auth.create_session_cookie("alice-under_score"))
+    assert set(token) <= _URI_UNRESERVED
 
 
 def test_session_cookie_round_trips_to_username():
