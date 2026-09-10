@@ -6,6 +6,7 @@ import pathlib
 
 import azure.functions as func
 
+import auth
 import storage
 from ical_builder import build_calendar
 from tvmaze_client import TVMazeError, get_show_with_episodes, search_shows
@@ -21,12 +22,59 @@ MAX_CONCURRENT_TVMAZE_FETCHES = 10
 
 @app.route(route="/", methods=["GET"])
 def index(req: func.HttpRequest) -> func.HttpResponse:
-    """GET / -> the search + watchlist single-page UI."""
+    """GET / -> the login form / search + watchlist single-page UI.
+
+    Unauthenticated (no valid session), since this is the one page that has
+    to load *before* anyone has a session -- it's what renders the login
+    form. The page itself decides client-side whether to show the app or
+    the login form, based on GET /auth/status.
+    """
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
     return func.HttpResponse(html, status_code=200, mimetype="text/html")
 
 
+@app.route(route="auth/login", methods=["POST"])
+def auth_login(req: func.HttpRequest) -> func.HttpResponse:
+    """POST /auth/login  body: {"password": str} -> sets the session cookie."""
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse("Request body must be JSON.", status_code=400)
+
+    password = body.get("password")
+    if not isinstance(password, str) or not password:
+        return func.HttpResponse("Body must include 'password'.", status_code=400)
+
+    try:
+        valid = auth.check_password(password)
+    except auth.AuthConfigError:
+        logging.error("Login attempted but auth app settings are not configured.")
+        return func.HttpResponse("Server auth is not configured.", status_code=500)
+
+    if not valid:
+        return func.HttpResponse("Incorrect password.", status_code=401)
+
+    return func.HttpResponse(status_code=204, headers={"Set-Cookie": auth.create_session_cookie()})
+
+
+@app.route(route="auth/logout", methods=["POST"])
+def auth_logout(req: func.HttpRequest) -> func.HttpResponse:
+    """POST /auth/logout -> clears the session cookie."""
+    return func.HttpResponse(status_code=204, headers={"Set-Cookie": auth.clear_session_cookie()})
+
+
+@app.route(route="auth/status", methods=["GET"])
+def auth_status(req: func.HttpRequest) -> func.HttpResponse:
+    """GET /auth/status -> {"authenticated": bool} for the current session cookie."""
+    return func.HttpResponse(
+        json.dumps({"authenticated": auth.is_authenticated(req)}),
+        status_code=200,
+        mimetype="application/json",
+    )
+
+
 @app.route(route="shows/search", methods=["GET"])
+@auth.require_session
 def search(req: func.HttpRequest) -> func.HttpResponse:
     """GET /shows/search?q=<name> -> matching shows with their TVMaze IDs."""
     query = req.params.get("q")
@@ -55,6 +103,7 @@ def search(req: func.HttpRequest) -> func.HttpResponse:
 
 
 @app.route(route="watchlist", methods=["GET"])
+@auth.require_session
 def watchlist_get(req: func.HttpRequest) -> func.HttpResponse:
     """GET /watchlist?list=<token> -> shows currently on that watchlist."""
     token = req.params.get("list")
@@ -70,6 +119,7 @@ def watchlist_get(req: func.HttpRequest) -> func.HttpResponse:
 
 
 @app.route(route="watchlist", methods=["POST"])
+@auth.require_session
 def watchlist_add(req: func.HttpRequest) -> func.HttpResponse:
     """POST /watchlist?list=<token>  body: {"show_id": int, "show_name": str}."""
     token = req.params.get("list")
@@ -108,6 +158,7 @@ def watchlist_add(req: func.HttpRequest) -> func.HttpResponse:
 
 
 @app.route(route="watchlist/feed-token", methods=["GET"])
+@auth.require_session
 def watchlist_feed_token(req: func.HttpRequest) -> func.HttpResponse:
     """GET /watchlist/feed-token?list=<token> -> the read-only calendar feed token.
 
@@ -130,6 +181,7 @@ def watchlist_feed_token(req: func.HttpRequest) -> func.HttpResponse:
 
 
 @app.route(route="watchlist/{show_id}", methods=["DELETE"])
+@auth.require_session
 def watchlist_remove(req: func.HttpRequest) -> func.HttpResponse:
     """DELETE /watchlist/{show_id}?list=<token> -> remove a show from the watchlist."""
     token = req.params.get("list")
@@ -160,6 +212,10 @@ def calendar_feed(req: func.HttpRequest) -> func.HttpResponse:
     as shows are added/removed -- no need to re-subscribe. The feed token is
     read-only by design -- it is not the watchlist's write token, so it
     can't be used to add or remove shows even if the URL leaks.
+
+    Deliberately not @auth.require_session: calendar apps fetch this URL
+    directly with no cookies at all, so a session gate would just break
+    subscriptions. The feed token is this endpoint's only gate.
     """
     feed_token = req.params.get("feed")
     raw_ids = req.params.get("show_ids")
