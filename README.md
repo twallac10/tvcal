@@ -127,6 +127,13 @@ network access.
 ## Deploying to Azure
 
 ```bash
+# storage account names: 3-24 chars, lowercase letters + digits only, globally unique
+az storage account create \
+  --name <storage-account-name> \
+  --resource-group <resource-group> \
+  --location <region> \
+  --sku Standard_LRS
+
 az functionapp create \
   --resource-group <resource-group> \
   --consumption-plan-location <region> \
@@ -137,13 +144,23 @@ az functionapp create \
   --storage-account <storage-account-name> \
   --os-type Linux
 
-func azure functionapp publish <function-app-name>
+# Azure Functions serves a built-in "your app is up and running" placeholder
+# at the bare root URL by default, which overrides the UI's route="" function
+# even though it's registered correctly. This setting disables that.
+az functionapp config appsettings set \
+  --resource-group <resource-group> \
+  --name <function-app-name> \
+  --settings AzureWebJobsDisableHomepage=true
+
+func azure functionapp publish <function-app-name> --python
 ```
 
-The app has no required app settings beyond the ones Azure Functions
-provisions automatically (`AzureWebJobsStorage`, `FUNCTIONS_WORKER_RUNTIME`).
-`AzureWebJobsStorage` is also where the watchlist table lives — no separate
-storage account needed.
+Beyond the ones Azure Functions provisions automatically
+(`AzureWebJobsStorage`, `FUNCTIONS_WORKER_RUNTIME`), the only required app
+setting is `AzureWebJobsDisableHomepage=true` above — without it, the UI at
+`/` is shadowed by Azure's default placeholder page even though every other
+route works. `AzureWebJobsStorage` is also where the watchlist table lives —
+no separate storage account needed beyond the one linked at creation.
 
 ## Project layout
 
