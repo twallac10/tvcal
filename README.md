@@ -120,13 +120,15 @@ Returns (creating on first call) the read-only feed token for your
 watchlist: `{"feed_token": "..."}`. Idempotent — repeat calls return the
 same token.
 
-### `GET /calendar.ics?feed=<feed_token>` or `?show_ids=<id,id,...>`
+### `GET /calendar.ics?feed=<feed_token>`
 
-Returns an `.ics` feed with one event per aired/upcoming episode. Use
-`feed=<feed_token>` (from `GET /watchlist/feed-token`) for a stable,
-auto-updating feed tied to a watchlist, or `show_ids=82,143` (max 50 IDs)
-for a one-off feed built from specific TVMaze show IDs without going
-through a watchlist at all.
+Returns an `.ics` feed with one event per aired/upcoming episode on the
+watchlist that `feed_token` (from `GET /watchlist/feed-token`) belongs to.
+Stable and auto-updating: subscribe once and it follows the watchlist.
+
+A valid feed token is the only way in. This endpoint takes no session
+cookie (calendar apps can't send one), so the token is what stops an
+anonymous caller from making it fan out requests to TVMaze.
 
 ```
 GET /calendar.ics?feed=RmVlZFRva2VuRXhhbXBsZQ
@@ -164,21 +166,20 @@ func start
 Then open `http://localhost:7071/` for the UI, click "Need an account? Sign
 up", and use invite code `changeme` (the value baked into
 `local.settings.json.example` — see **Signing in** above; fine for local
-dev, never use it in production) to create yourself an account. Signed-in
-API calls need the session cookie, so for `curl` either sign up/in through a
-cookie jar:
+dev, never use it in production) to create yourself an account. Every API
+call except `/calendar.ics` needs the session cookie, so drive `curl`
+through a cookie jar:
 
 ```bash
 curl -c /tmp/tvcal-cookies -X POST http://localhost:7071/auth/signup \
   -H "Content-Type: application/json" \
   -d '{"username":"me","password":"a-real-password","signup_code":"changeme"}'
+
 curl -b /tmp/tvcal-cookies "http://localhost:7071/shows/search?q=fringe"
-```
 
-or use `/calendar.ics?show_ids=...`, which never needs a session:
-
-```bash
-curl "http://localhost:7071/calendar.ics?show_ids=82"
+# the calendar feed takes no cookie -- grab its token, then fetch it
+curl -b /tmp/tvcal-cookies "http://localhost:7071/watchlist/feed-token"
+curl "http://localhost:7071/calendar.ics?feed=<feed_token from above>"
 ```
 
 ## Tests

@@ -401,7 +401,7 @@ def test_watchlist_feed_token_returns_storage_value_for_signed_in_user(monkeypat
     assert calls == ["testuser"]
 
 
-def test_calendar_feed_requires_feed_or_show_ids():
+def test_calendar_feed_requires_a_feed_token():
     response = function_app.calendar_feed(_request("GET", "calendar.ics"))
     assert response.status_code == 400
 
@@ -597,9 +597,18 @@ def test_auth_signup_rejects_an_oversized_password(monkeypatch):
     assert response.status_code == 400
 
 
-def test_calendar_feed_caps_show_ids_param():
-    ids = ",".join(str(i) for i in range(1, function_app.MAX_SHOW_IDS_PARAM + 2))
+def test_calendar_feed_ignores_the_removed_show_ids_param(monkeypatch):
+    # ?show_ids= was an anonymous, tokenless way to make this endpoint fan
+    # out one TVMaze request per listed ID -- an amplification vector
+    # guarding functionality nothing used. It must stay gone: without a
+    # feed token, no caller reaches TVMaze through here at all.
+    def fail_if_called(show_id):
+        raise AssertionError("no TVMaze fetch should happen without a feed token")
+
+    monkeypatch.setattr(function_app, "get_show_with_episodes", fail_if_called)
+
     response = function_app.calendar_feed(
-        _request("GET", "calendar.ics", params={"show_ids": ids})
+        _request("GET", "calendar.ics", params={"show_ids": "82,143"})
     )
+
     assert response.status_code == 400

@@ -16,7 +16,6 @@ app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 STATIC_DIR = pathlib.Path(__file__).parent / "static"
 MAX_SHOW_NAME_LENGTH = 200
 MAX_SHOW_ID = 10**15
-MAX_SHOW_IDS_PARAM = 50
 MAX_CONCURRENT_TVMAZE_FETCHES = 10
 MIN_PASSWORD_LENGTH = 8
 # /auth/login and /auth/signup are anonymous and always run PBKDF2, so an
@@ -260,52 +259,34 @@ def watchlist_remove(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="calendar.ics", methods=["GET"])
 def calendar_feed(req: func.HttpRequest) -> func.HttpResponse:
-    """GET /calendar.ics?feed=<feed_token> or ?show_ids=<id,id,...> -> iCal feed.
+    """GET /calendar.ics?feed=<feed_token> -> iCal feed for that watchlist.
 
     The URL is meant to be pasted straight into a calendar app (Google
     Calendar, Apple Calendar, Outlook, ...) as a subscription so new episodes
-    show up automatically as TVMaze publishes air dates. When built from a
-    feed token (see GET /watchlist/feed-token), the same URL keeps working
-    as shows are added/removed -- no need to re-subscribe. The feed token is
-    read-only by design -- it is not the watchlist's write token, so it
+    show up automatically as TVMaze publishes air dates. The same URL keeps
+    working as shows are added/removed -- no need to re-subscribe. The feed
+    token is read-only by design -- it is not the account's login, so it
     can't be used to add or remove shows even if the URL leaks.
 
     Deliberately not @auth.require_session: calendar apps fetch this URL
     directly with no cookies at all, so a session gate would just break
-    subscriptions. The feed token is this endpoint's only gate.
+    subscriptions. The feed token is this endpoint's only gate, and it's
+    the only way in -- an unauthenticated caller with no token can't make
+    this endpoint reach TVMaze at all.
     """
     feed_token = req.params.get("feed")
-    raw_ids = req.params.get("show_ids")
-
-    if feed_token:
-        try:
-            write_token = storage.resolve_feed_token(feed_token)
-            show_ids = [show["id"] for show in storage.list_shows(write_token)]
-        except storage.InvalidListToken as exc:
-            return func.HttpResponse(str(exc), status_code=400)
-        except storage.UnknownFeedToken as exc:
-            return func.HttpResponse(str(exc), status_code=404)
-    elif raw_ids:
-        try:
-            show_ids = list(
-                dict.fromkeys(int(value.strip()) for value in raw_ids.split(",") if value.strip())
-            )
-        except ValueError:
-            return func.HttpResponse(
-                "show_ids must be a comma-separated list of TVMaze show IDs.", status_code=400
-            )
-        if not show_ids:
-            return func.HttpResponse("No valid show IDs supplied.", status_code=400)
-        if len(show_ids) > MAX_SHOW_IDS_PARAM:
-            return func.HttpResponse(
-                f"show_ids supports at most {MAX_SHOW_IDS_PARAM} shows per request.",
-                status_code=400,
-            )
-    else:
+    if not feed_token:
         return func.HttpResponse(
-            "Query parameter 'feed' (calendar feed token) or 'show_ids' is required.",
-            status_code=400,
+            "Query parameter 'feed' (calendar feed token) is required.", status_code=400
         )
+
+    try:
+        write_token = storage.resolve_feed_token(feed_token)
+        show_ids = [show["id"] for show in storage.list_shows(write_token)]
+    except storage.InvalidListToken as exc:
+        return func.HttpResponse(str(exc), status_code=400)
+    except storage.UnknownFeedToken as exc:
+        return func.HttpResponse(str(exc), status_code=404)
 
     # Concurrent: fetching a large watchlist one show at a time would risk
     # the platform's request timeout.
