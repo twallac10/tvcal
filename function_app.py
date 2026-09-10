@@ -1,4 +1,5 @@
 """Azure Functions app: search TVMaze shows and subscribe to episode iCal feeds."""
+import concurrent.futures
 import json
 import logging
 import pathlib
@@ -13,7 +14,9 @@ app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
 STATIC_DIR = pathlib.Path(__file__).parent / "static"
 MAX_SHOW_NAME_LENGTH = 200
+MAX_SHOW_ID = 10**15
 MAX_SHOW_IDS_PARAM = 50
+MAX_CONCURRENT_TVMAZE_FETCHES = 10
 
 
 @app.route(route="", methods=["GET"])
@@ -32,22 +35,22 @@ def search(req: func.HttpRequest) -> func.HttpResponse:
 
     try:
         shows = search_shows(query)
+        results = [
+            {
+                "id": show["id"],
+                "name": show["name"],
+                "premiered": show.get("premiered"),
+                "status": show.get("status"),
+                "network": ((show.get("network") or show.get("webChannel")) or {}).get("name"),
+                "image": (show.get("image") or {}).get("medium"),
+                "summary": show.get("summary"),
+            }
+            for show in shows
+        ]
     except Exception:
         logging.exception("TVMaze search failed for query=%s", query)
         return func.HttpResponse("Failed to reach TVMaze.", status_code=502)
 
-    results = [
-        {
-            "id": show["id"],
-            "name": show["name"],
-            "premiered": show.get("premiered"),
-            "status": show.get("status"),
-            "network": ((show.get("network") or show.get("webChannel")) or {}).get("name"),
-            "image": (show.get("image") or {}).get("medium"),
-            "summary": show.get("summary"),
-        }
-        for show in shows
-    ]
     return func.HttpResponse(json.dumps(results), status_code=200, mimetype="application/json")
 
 
@@ -83,7 +86,7 @@ def watchlist_add(req: func.HttpRequest) -> func.HttpResponse:
     if (
         not isinstance(show_id, int)
         or isinstance(show_id, bool)
-        or show_id <= 0
+        or not (0 < show_id < MAX_SHOW_ID)
         or not isinstance(show_name, str)
         or not show_name.strip()
         or len(show_name) > MAX_SHOW_NAME_LENGTH
@@ -164,16 +167,20 @@ def calendar_feed(req: func.HttpRequest) -> func.HttpResponse:
             status_code=400,
         )
 
-    # Best-effort: a single missing/broken show shouldn't blank out the whole
-    # subscription for every other show on the list.
+    # Best-effort and concurrent: a single missing/broken show shouldn't blank
+    # out the whole subscription for every other show, and fetching shows one
+    # at a time would risk the platform's request timeout on a large watchlist.
     shows_with_episodes = []
-    for show_id in show_ids:
-        try:
-            shows_with_episodes.append(get_show_with_episodes(show_id))
-        except TVMazeError:
-            logging.warning("Skipping unknown TVMaze show_id=%s", show_id)
-        except Exception:
-            logging.exception("TVMaze lookup failed for show_id=%s", show_id)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TVMAZE_FETCHES) as pool:
+        future_to_show_id = {pool.submit(get_show_with_episodes, show_id): show_id for show_id in show_ids}
+        for future in concurrent.futures.as_completed(future_to_show_id):
+            show_id = future_to_show_id[future]
+            try:
+                shows_with_episodes.append(future.result())
+            except TVMazeError:
+                logging.warning("Skipping unknown TVMaze show_id=%s", show_id)
+            except Exception:
+                logging.exception("TVMaze lookup failed for show_id=%s", show_id)
 
     calendar = build_calendar(shows_with_episodes)
     return func.HttpResponse(

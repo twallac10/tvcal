@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 
 from azure.core.exceptions import ResourceNotFoundError
 from azure.data.tables import TableServiceClient
@@ -18,6 +19,7 @@ MAX_WATCHLIST_SIZE = 100
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 
 _table_client_singleton = None
+_table_client_lock = threading.Lock()
 
 
 class InvalidListToken(Exception):
@@ -38,10 +40,12 @@ def validate_token(list_token: str) -> None:
 def _table_client():
     global _table_client_singleton
     if _table_client_singleton is None:
-        connection_string = os.environ["AzureWebJobsStorage"]
-        service = TableServiceClient.from_connection_string(connection_string)
-        service.create_table_if_not_exists(TABLE_NAME)
-        _table_client_singleton = service.get_table_client(TABLE_NAME)
+        with _table_client_lock:
+            if _table_client_singleton is None:
+                connection_string = os.environ["AzureWebJobsStorage"]
+                service = TableServiceClient.from_connection_string(connection_string)
+                service.create_table_if_not_exists(TABLE_NAME)
+                _table_client_singleton = service.get_table_client(TABLE_NAME)
     return _table_client_singleton
 
 

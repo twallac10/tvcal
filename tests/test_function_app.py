@@ -17,6 +17,16 @@ def _request(method, route, params=None, route_params=None, body=b""):
     )
 
 
+def test_search_returns_502_when_tvmaze_result_is_missing_required_fields(monkeypatch):
+    # A TVMaze result missing "id"/"name" should degrade to the same 502 the
+    # fetch-failure path uses, not an unhandled 500 from the response shaping.
+    monkeypatch.setattr(function_app, "search_shows", lambda query: [{"name": "no id"}])
+
+    response = function_app.search(_request("GET", "shows/search", params={"q": "fringe"}))
+
+    assert response.status_code == 502
+
+
 def test_watchlist_get_requires_list_param():
     response = function_app.watchlist_get(_request("GET", "watchlist"))
     assert response.status_code == 400
@@ -73,6 +83,16 @@ def test_watchlist_add_rejects_boolean_show_id():
 
 def test_watchlist_add_rejects_oversized_show_name():
     body = json.dumps({"show_id": 82, "show_name": "x" * 500}).encode()
+    response = function_app.watchlist_add(
+        _request("POST", "watchlist", params={"list": "abc123"}, body=body)
+    )
+    assert response.status_code == 400
+
+
+def test_watchlist_add_rejects_show_id_too_large_for_table_storage_row_key():
+    # Table Storage RowKeys are capped at 1024 chars; anything absurdly large
+    # should be rejected with a clean 400 instead of failing inside storage.
+    body = json.dumps({"show_id": 10**16, "show_name": "Fringe"}).encode()
     response = function_app.watchlist_add(
         _request("POST", "watchlist", params={"list": "abc123"}, body=body)
     )
@@ -161,6 +181,32 @@ def test_calendar_feed_skips_a_broken_show_but_keeps_the_rest(monkeypatch):
 
     assert response.status_code == 200
     assert b"Fringe - S01E01 - Pilot" in response.get_body()
+
+
+def test_calendar_feed_concurrent_fetch_isolates_multiple_failures(monkeypatch):
+    good_ids = {82, 143, 144}
+    bad_ids = {999, 1000}
+    monkeypatch.setattr(
+        storage,
+        "list_shows",
+        lambda token: [{"id": i, "name": str(i)} for i in sorted(good_ids | bad_ids)],
+    )
+
+    def fake_get_show_with_episodes(show_id):
+        if show_id in bad_ids:
+            raise TVMazeError("gone")
+        return {"id": show_id, "name": f"Show {show_id}", "runtime": 60}, [
+            {**_PILOT_EPISODE, "id": show_id}
+        ]
+
+    monkeypatch.setattr(function_app, "get_show_with_episodes", fake_get_show_with_episodes)
+
+    response = function_app.calendar_feed(_request("GET", "calendar.ics", params={"list": "abc123"}))
+    body = response.get_body()
+
+    assert response.status_code == 200
+    for show_id in good_ids:
+        assert f"tvmaze-episode-{show_id}@tvcal".encode() in body
 
 
 def test_calendar_feed_caps_show_ids_param():

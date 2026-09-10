@@ -76,3 +76,29 @@ def test_build_calendar_skips_episode_missing_id():
     calendar = build_calendar([(SHOW, [episode])])
 
     assert calendar.walk("VEVENT") == []
+
+
+def test_build_calendar_skips_episode_with_non_numeric_runtime_but_keeps_others():
+    bad_episode = {**AIRED_EPISODE, "id": 2001, "runtime": "60"}
+    calendar = build_calendar([(SHOW, [bad_episode, AIRED_EPISODE])])
+
+    events = calendar.walk("VEVENT")
+    assert len(events) == 1
+    assert events[0]["uid"] == "tvmaze-episode-1001@tvcal"
+
+
+def test_build_calendar_skips_episode_with_non_numeric_season_but_keeps_others():
+    bad_episode = {**AIRED_EPISODE, "id": 2002, "season": "1"}
+    calendar = build_calendar([(SHOW, [bad_episode, AIRED_EPISODE])])
+
+    events = calendar.walk("VEVENT")
+    assert len(events) == 1
+    assert events[0]["uid"] == "tvmaze-episode-1001@tvcal"
+
+
+def test_build_calendar_unescapes_html_entities_in_description():
+    episode = {**AIRED_EPISODE, "summary": "<p>Rock &amp; Roll</p>"}
+    calendar = build_calendar([(SHOW, [episode])])
+    event = calendar.walk("VEVENT")[0]
+
+    assert str(event["description"]) == "Rock & Roll"

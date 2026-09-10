@@ -1,6 +1,7 @@
 """Builds an iCalendar feed of episode air dates from TVMaze data."""
 from __future__ import annotations
 
+import html
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -20,7 +21,18 @@ def build_calendar(shows_with_episodes: list[tuple[dict, list[dict]]]) -> Calend
 
     for show, episodes in shows_with_episodes:
         for episode in episodes:
-            event = build_event(show, episode)
+            try:
+                event = build_event(show, episode)
+            except (TypeError, ValueError):
+                # TVMaze data is untrusted input -- an episode with a
+                # malformed field (e.g. a non-numeric runtime/season/number)
+                # shouldn't take down every other show's events with it.
+                logging.warning(
+                    "Skipping malformed episode %r for show %r",
+                    episode.get("id"),
+                    show.get("id"),
+                )
+                continue
             if event is not None:
                 calendar.add_component(event)
 
@@ -77,4 +89,4 @@ def _format_episode_code(episode: dict) -> str:
 def _clean_summary(summary: str | None) -> str:
     if not summary:
         return ""
-    return _HTML_TAG_RE.sub("", summary).strip()
+    return html.unescape(_HTML_TAG_RE.sub("", summary)).strip()
