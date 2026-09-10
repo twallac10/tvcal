@@ -49,18 +49,20 @@
   }
   h2 { margin: 0 0 14px; font-size: 1.05rem; }
   form { display: flex; gap: 8px; }
-  input[type="search"], input[type="text"] {
+  input[type="search"], input[type="text"], input[type="password"] {
     flex: 1;
     min-width: 0;
-    padding: 10px 12px;
+    padding: 12px;
     border: 1px solid var(--border);
     border-radius: 8px;
     background: var(--bg);
     color: var(--text);
-    font-size: 0.95rem;
+    /* 16px prevents iOS Safari from auto-zooming the page on focus */
+    font-size: 16px;
   }
   button {
-    padding: 10px 16px;
+    padding: 12px 16px;
+    min-height: 44px;
     border: none;
     border-radius: 8px;
     background: var(--accent);
@@ -69,6 +71,8 @@
     font-weight: 600;
     cursor: pointer;
     white-space: nowrap;
+    touch-action: manipulation;
+    flex-shrink: 0;
   }
   button:disabled { opacity: 0.6; cursor: default; }
   button.remove-btn, button.secondary {
@@ -100,8 +104,8 @@
     flex-shrink: 0;
   }
   .show-info { flex: 1; min-width: 0; }
-  .show-info h3 { margin: 0; font-size: 0.98rem; }
-  .show-info p { margin: 2px 0 0; font-size: 0.85rem; color: var(--text-muted); }
+  .show-info h3 { margin: 0; font-size: 0.98rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .show-info p { margin: 2px 0 0; font-size: 0.85rem; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #watchlist-items {
     list-style: none;
     margin: 0;
@@ -113,16 +117,23 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 8px;
     padding: 10px 12px;
     border: 1px solid var(--border);
     border-radius: 8px;
     font-size: 0.95rem;
   }
-  .feed-row { display: flex; gap: 8px; }
-  .feed-row input { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.85rem; }
+  .watchlist-item span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .feed-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .feed-row input { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.85rem; flex: 1 1 220px; }
   .hint { color: var(--text-muted); font-size: 0.85rem; margin: 10px 0 0; }
   .error { color: var(--danger); font-size: 0.85rem; margin: 10px 0 0; }
-  .topbar { display: flex; justify-content: flex-end; margin-bottom: 8px; }
+  .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; gap: 8px; }
+  .topbar span { color: var(--text-muted); font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .auth-form { display: flex; flex-direction: column; gap: 10px; }
+  .auth-links { margin-top: 12px; }
+  .auth-links a { color: var(--accent); text-decoration: none; font-size: 0.9rem; }
+  .auth-links a:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -133,16 +144,29 @@
   </header>
 
   <section id="login-section" hidden>
-    <h2>Sign in</h2>
-    <form id="login-form">
+    <h2 id="auth-heading">Sign in</h2>
+
+    <form id="login-form" class="auth-form">
+      <input type="text" id="login-username" placeholder="Username" autocomplete="username" autocapitalize="off" autofocus required>
       <input type="password" id="login-password" placeholder="Password" autocomplete="current-password" required>
       <button type="submit">Sign in</button>
     </form>
+
+    <form id="signup-form" class="auth-form" hidden>
+      <input type="text" id="signup-username" placeholder="Username" autocomplete="username" autocapitalize="off" required>
+      <input type="password" id="signup-password" placeholder="Password (min 8 characters)" autocomplete="new-password" minlength="8" required>
+      <input type="text" id="signup-code" placeholder="Invite code" autocomplete="off" required>
+      <button type="submit">Create account</button>
+    </form>
+
     <p id="login-error" class="error" hidden></p>
+
+    <p class="auth-links"><a href="#" id="auth-mode-toggle">Need an account? Sign up</a></p>
   </section>
 
   <div id="app-section" hidden>
     <div class="topbar">
+      <span id="signed-in-as"></span>
       <button type="button" id="logout-btn" class="secondary">Log out</button>
     </div>
 
@@ -172,7 +196,7 @@
 </main>
 
 <script>
-  const state = { token: null, feedToken: null, watchlist: [] };
+  const state = { username: null, feedToken: null, watchlist: [] };
 
   async function apiFetch(url, options) {
     const res = await fetch(url, options);
@@ -182,38 +206,48 @@
     return res;
   }
 
+  function setAuthMode(mode) {
+    const isSignup = mode === "signup";
+    document.getElementById("login-form").hidden = isSignup;
+    document.getElementById("signup-form").hidden = !isSignup;
+    document.getElementById("auth-heading").textContent = isSignup ? "Create account" : "Sign in";
+    document.getElementById("auth-mode-toggle").textContent = isSignup
+      ? "Already have an account? Sign in"
+      : "Need an account? Sign up";
+    document.getElementById("login-error").hidden = true;
+  }
+
   function showLoginForm() {
     document.getElementById("login-section").hidden = false;
     document.getElementById("app-section").hidden = true;
+    setAuthMode("login");
   }
 
   function showApp() {
     document.getElementById("login-section").hidden = true;
     document.getElementById("app-section").hidden = false;
-    state.token = getOrCreateToken();
+    document.getElementById("signed-in-as").textContent = state.username
+      ? `Signed in as ${state.username}`
+      : "";
     loadWatchlist();
   }
 
   async function checkAuthAndInit() {
     const res = await fetch("/auth/status");
-    const data = res.ok ? await res.json() : { authenticated: false };
+    const data = res.ok ? await res.json() : { authenticated: false, username: null };
     if (data.authenticated) {
+      state.username = data.username;
       showApp();
     } else {
       showLoginForm();
     }
   }
 
-  function getOrCreateToken() {
-    const url = new URL(location.href);
-    let token = url.searchParams.get("list") || localStorage.getItem("tvcal_list_token");
-    if (!token) {
-      token = crypto.randomUUID();
-    }
-    localStorage.setItem("tvcal_list_token", token);
-    url.searchParams.set("list", token);
-    history.replaceState(null, "", url);
-    return token;
+  async function showAuthError(res, fallback) {
+    const errorEl = document.getElementById("login-error");
+    const message = (await res.text()) || fallback;
+    errorEl.textContent = message;
+    errorEl.hidden = false;
   }
 
   function isInWatchlist(id) {
@@ -221,7 +255,7 @@
   }
 
   async function loadWatchlist() {
-    const res = await apiFetch(`/watchlist?list=${encodeURIComponent(state.token)}`);
+    const res = await apiFetch("/watchlist");
     state.watchlist = res.ok ? await res.json() : [];
     renderWatchlist();
 
@@ -233,7 +267,7 @@
   }
 
   async function loadFeedToken() {
-    const res = await apiFetch(`/watchlist/feed-token?list=${encodeURIComponent(state.token)}`);
+    const res = await apiFetch("/watchlist/feed-token");
     if (res.ok) {
       state.feedToken = (await res.json()).feed_token;
     }
@@ -345,7 +379,7 @@
   }
 
   async function addShow(id, name) {
-    const res = await apiFetch(`/watchlist?list=${encodeURIComponent(state.token)}`, {
+    const res = await apiFetch("/watchlist", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ show_id: id, show_name: name }),
@@ -357,7 +391,7 @@
   }
 
   async function removeShow(id) {
-    await apiFetch(`/watchlist/${id}?list=${encodeURIComponent(state.token)}`, { method: "DELETE" });
+    await apiFetch(`/watchlist/${id}`, { method: "DELETE" });
     await loadWatchlist();
   }
 
@@ -381,29 +415,71 @@
     setTimeout(() => { btn.textContent = original; }, 1500);
   });
 
+  document.getElementById("auth-mode-toggle").addEventListener("click", (event) => {
+    event.preventDefault();
+    const isSignup = !document.getElementById("signup-form").hidden;
+    setAuthMode(isSignup ? "login" : "signup");
+  });
+
   document.getElementById("login-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    const passwordInput = document.getElementById("login-password");
-    const errorEl = document.getElementById("login-error");
-    errorEl.hidden = true;
+    const username = document.getElementById("login-username").value.trim();
+    const password = document.getElementById("login-password").value;
+    document.getElementById("login-error").hidden = true;
 
     const res = await fetch("/auth/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ password: passwordInput.value }),
+      body: JSON.stringify({ username, password }),
     });
 
     if (res.ok) {
-      passwordInput.value = "";
+      document.getElementById("login-password").value = "";
+      state.username = username.toLowerCase();
       showApp();
     } else {
-      errorEl.textContent = "Incorrect password.";
-      errorEl.hidden = false;
+      await showAuthError(res, "Incorrect username or password.");
+    }
+  });
+
+  document.getElementById("signup-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const username = document.getElementById("signup-username").value.trim();
+    const password = document.getElementById("signup-password").value;
+    const signupCode = document.getElementById("signup-code").value;
+    document.getElementById("login-error").hidden = true;
+
+    // A pre-account browser may already have a watchlist under the old
+    // localStorage-token scheme -- fold it into the new account, once.
+    const previousToken = localStorage.getItem("tvcal_list_token") || undefined;
+
+    const res = await fetch("/auth/signup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username,
+        password,
+        signup_code: signupCode,
+        previous_token: previousToken,
+      }),
+    });
+
+    if (res.ok) {
+      localStorage.removeItem("tvcal_list_token");
+      document.getElementById("signup-password").value = "";
+      document.getElementById("signup-code").value = "";
+      state.username = username.toLowerCase();
+      showApp();
+    } else {
+      await showAuthError(res, "Couldn't create account.");
     }
   });
 
   document.getElementById("logout-btn").addEventListener("click", async () => {
     await fetch("/auth/logout", { method: "POST" });
+    state.username = null;
+    state.feedToken = null;
+    state.watchlist = [];
     showLoginForm();
   });
 

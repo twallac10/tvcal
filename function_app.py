@@ -18,6 +18,7 @@ MAX_SHOW_NAME_LENGTH = 200
 MAX_SHOW_ID = 10**15
 MAX_SHOW_IDS_PARAM = 50
 MAX_CONCURRENT_TVMAZE_FETCHES = 10
+MIN_PASSWORD_LENGTH = 8
 
 
 @app.route(route="/", methods=["GET"])
@@ -33,28 +34,97 @@ def index(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(html, status_code=200, mimetype="text/html")
 
 
-@app.route(route="auth/login", methods=["POST"])
-def auth_login(req: func.HttpRequest) -> func.HttpResponse:
-    """POST /auth/login  body: {"password": str} -> sets the session cookie."""
+@app.route(route="auth/signup", methods=["POST"])
+def auth_signup(req: func.HttpRequest) -> func.HttpResponse:
+    """POST /auth/signup  body: {"username", "password", "signup_code", "previous_token"?}.
+
+    signup_code gates account creation (see the SIGNUP_CODE app setting) --
+    it's shared out-of-band with whoever should get an account, same trust
+    model as the old shared password, but only for this one step.
+    previous_token, if given, is a pre-account browser's watchlist token
+    (localStorage) to fold into the new account -- best-effort, ignored if
+    missing/invalid so it never blocks signup itself.
+    """
     try:
         body = req.get_json()
     except ValueError:
         return func.HttpResponse("Request body must be JSON.", status_code=400)
 
+    username = body.get("username")
     password = body.get("password")
-    if not isinstance(password, str) or not password:
-        return func.HttpResponse("Body must include 'password'.", status_code=400)
+    signup_code = body.get("signup_code")
+    previous_token = body.get("previous_token")
+
+    if (
+        not isinstance(username, str)
+        or not isinstance(password, str)
+        or not isinstance(signup_code, str)
+        or not signup_code
+    ):
+        return func.HttpResponse(
+            "Body must include 'username', 'password', and 'signup_code'.", status_code=400
+        )
+    if len(password) < MIN_PASSWORD_LENGTH:
+        return func.HttpResponse(
+            f"Password must be at least {MIN_PASSWORD_LENGTH} characters.", status_code=400
+        )
 
     try:
-        valid = auth.check_password(password)
+        code_ok = auth.check_signup_code(signup_code)
+    except auth.AuthConfigError:
+        logging.error("Signup attempted but SIGNUP_CODE app setting is not configured.")
+        return func.HttpResponse("Server auth is not configured.", status_code=500)
+    if not code_ok:
+        return func.HttpResponse("Invalid signup code.", status_code=401)
+
+    try:
+        normalized_username = auth.create_account(username, password)
+    except auth.InvalidUsername as exc:
+        return func.HttpResponse(str(exc), status_code=400)
+    except storage.UsernameTaken as exc:
+        return func.HttpResponse(str(exc), status_code=409)
+    except storage.TooManyAccounts as exc:
+        return func.HttpResponse(str(exc), status_code=403)
+
+    if isinstance(previous_token, str) and previous_token:
+        try:
+            storage.migrate_watchlist(previous_token, normalized_username)
+        except storage.InvalidListToken:
+            pass  # stale/malformed previous_token -- signup still succeeds
+
+    try:
+        cookie = auth.create_session_cookie(normalized_username)
+    except auth.AuthConfigError:
+        logging.error("Signup succeeded but SESSION_SECRET is not configured.")
+        return func.HttpResponse("Server auth is not configured.", status_code=500)
+
+    return func.HttpResponse(status_code=204, headers={"Set-Cookie": cookie})
+
+
+@app.route(route="auth/login", methods=["POST"])
+def auth_login(req: func.HttpRequest) -> func.HttpResponse:
+    """POST /auth/login  body: {"username": str, "password": str} -> sets the session cookie."""
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse("Request body must be JSON.", status_code=400)
+
+    username = body.get("username")
+    password = body.get("password")
+    if not isinstance(username, str) or not username or not isinstance(password, str) or not password:
+        return func.HttpResponse("Body must include 'username' and 'password'.", status_code=400)
+
+    try:
+        valid = auth.verify_login(username, password)
+        cookie = auth.create_session_cookie(username.lower()) if valid else None
     except auth.AuthConfigError:
         logging.error("Login attempted but auth app settings are not configured.")
         return func.HttpResponse("Server auth is not configured.", status_code=500)
 
     if not valid:
-        return func.HttpResponse("Incorrect password.", status_code=401)
+        return func.HttpResponse("Incorrect username or password.", status_code=401)
 
-    return func.HttpResponse(status_code=204, headers={"Set-Cookie": auth.create_session_cookie()})
+    return func.HttpResponse(status_code=204, headers={"Set-Cookie": cookie})
 
 
 @app.route(route="auth/logout", methods=["POST"])
@@ -65,9 +135,10 @@ def auth_logout(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="auth/status", methods=["GET"])
 def auth_status(req: func.HttpRequest) -> func.HttpResponse:
-    """GET /auth/status -> {"authenticated": bool} for the current session cookie."""
+    """GET /auth/status -> {"authenticated": bool, "username": str | None}."""
+    username = auth.get_username(req)
     return func.HttpResponse(
-        json.dumps({"authenticated": auth.is_authenticated(req)}),
+        json.dumps({"authenticated": username is not None, "username": username}),
         status_code=200,
         mimetype="application/json",
     )
@@ -105,27 +176,15 @@ def search(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="watchlist", methods=["GET"])
 @auth.require_session
 def watchlist_get(req: func.HttpRequest) -> func.HttpResponse:
-    """GET /watchlist?list=<token> -> shows currently on that watchlist."""
-    token = req.params.get("list")
-    if not token:
-        return func.HttpResponse("Query parameter 'list' is required.", status_code=400)
-
-    try:
-        shows = storage.list_shows(token)
-    except storage.InvalidListToken as exc:
-        return func.HttpResponse(str(exc), status_code=400)
-
+    """GET /watchlist -> shows on the signed-in account's watchlist."""
+    shows = storage.list_shows(auth.get_username(req))
     return func.HttpResponse(json.dumps(shows), status_code=200, mimetype="application/json")
 
 
 @app.route(route="watchlist", methods=["POST"])
 @auth.require_session
 def watchlist_add(req: func.HttpRequest) -> func.HttpResponse:
-    """POST /watchlist?list=<token>  body: {"show_id": int, "show_name": str}."""
-    token = req.params.get("list")
-    if not token:
-        return func.HttpResponse("Query parameter 'list' is required.", status_code=400)
-
+    """POST /watchlist  body: {"show_id": int, "show_name": str} -> add to your watchlist."""
     try:
         body = req.get_json()
     except ValueError:
@@ -148,9 +207,7 @@ def watchlist_add(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     try:
-        storage.add_show(token, show_id, show_name)
-    except storage.InvalidListToken as exc:
-        return func.HttpResponse(str(exc), status_code=400)
+        storage.add_show(auth.get_username(req), show_id, show_name)
     except storage.WatchlistFull as exc:
         return func.HttpResponse(str(exc), status_code=409)
 
@@ -160,21 +217,13 @@ def watchlist_add(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="watchlist/feed-token", methods=["GET"])
 @auth.require_session
 def watchlist_feed_token(req: func.HttpRequest) -> func.HttpResponse:
-    """GET /watchlist/feed-token?list=<token> -> the read-only calendar feed token.
+    """GET /watchlist/feed-token -> the read-only calendar feed token for your watchlist.
 
-    This token (not the write token above) is what belongs in a calendar
-    subscription URL: it can only be used to read episode air dates, never
-    to add or remove shows, so leaking it doesn't expose write access.
+    This token (not your login) is what belongs in a calendar subscription
+    URL: it can only be used to read episode air dates, never to add or
+    remove shows, so leaking it doesn't expose your account.
     """
-    token = req.params.get("list")
-    if not token:
-        return func.HttpResponse("Query parameter 'list' is required.", status_code=400)
-
-    try:
-        feed_token = storage.get_or_create_feed_token(token)
-    except storage.InvalidListToken as exc:
-        return func.HttpResponse(str(exc), status_code=400)
-
+    feed_token = storage.get_or_create_feed_token(auth.get_username(req))
     return func.HttpResponse(
         json.dumps({"feed_token": feed_token}), status_code=200, mimetype="application/json"
     )
@@ -183,21 +232,13 @@ def watchlist_feed_token(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="watchlist/{show_id}", methods=["DELETE"])
 @auth.require_session
 def watchlist_remove(req: func.HttpRequest) -> func.HttpResponse:
-    """DELETE /watchlist/{show_id}?list=<token> -> remove a show from the watchlist."""
-    token = req.params.get("list")
-    if not token:
-        return func.HttpResponse("Query parameter 'list' is required.", status_code=400)
-
+    """DELETE /watchlist/{show_id} -> remove a show from your watchlist."""
     try:
         show_id = int(req.route_params["show_id"])
     except (KeyError, ValueError):
         return func.HttpResponse("show_id must be an integer.", status_code=400)
 
-    try:
-        storage.remove_show(token, show_id)
-    except storage.InvalidListToken as exc:
-        return func.HttpResponse(str(exc), status_code=400)
-
+    storage.remove_show(auth.get_username(req), show_id)
     return func.HttpResponse(status_code=204)
 
 

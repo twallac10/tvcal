@@ -172,3 +172,100 @@ def test_get_or_create_feed_token_rejects_invalid_write_token(fake_client, bad_t
 def test_resolve_feed_token_rejects_invalid_format(fake_client, bad_token):
     with pytest.raises(storage.InvalidListToken):
         storage.resolve_feed_token(bad_token)
+
+
+# -- accounts -------------------------------------------------------------
+
+
+def test_create_and_get_account(fake_client):
+    storage.create_account("alice", "hash123", "salt456", 600_000)
+
+    account = storage.get_account("alice")
+    assert account == {"password_hash": "hash123", "salt": "salt456", "iterations": 600_000}
+
+
+def test_get_unknown_account_raises(fake_client):
+    with pytest.raises(storage.UnknownAccount):
+        storage.get_account("nobody")
+
+
+def test_create_account_raises_when_username_taken(fake_client):
+    storage.create_account("alice", "hash1", "salt1", 600_000)
+    with pytest.raises(storage.UsernameTaken):
+        storage.create_account("alice", "hash2", "salt2", 600_000)
+
+
+def test_create_account_rejects_once_max_accounts_reached(fake_client, monkeypatch):
+    monkeypatch.setattr(storage, "MAX_ACCOUNTS", 2)
+
+    storage.create_account("alice", "hash1", "salt1", 600_000)
+    storage.create_account("bob", "hash2", "salt2", 600_000)
+
+    with pytest.raises(storage.TooManyAccounts):
+        storage.create_account("carol", "hash3", "salt3", 600_000)
+
+
+def test_accounts_partition_does_not_collide_with_a_same_named_watchlist(fake_client):
+    # Accounts and watchlists share the underlying table but use disjoint
+    # PartitionKeys, so a username equal to some unrelated watchlist token
+    # can't see or corrupt that watchlist's rows.
+    storage.add_show("alice", 82, "Fringe")
+    storage.create_account("alice", "hash1", "salt1", 600_000)
+
+    assert storage.list_shows("alice") == [{"id": 82, "name": "Fringe"}]
+    assert storage.get_account("alice") == {
+        "password_hash": "hash1",
+        "salt": "salt1",
+        "iterations": 600_000,
+    }
+
+
+# -- migrate_watchlist ------------------------------------------------------
+
+
+def test_migrate_watchlist_copies_shows_to_new_owner(fake_client):
+    storage.add_show("old-token-abc", 82, "Fringe")
+    storage.add_show("old-token-abc", 143, "Breaking Bad")
+
+    storage.migrate_watchlist("old-token-abc", "alice")
+
+    assert storage.list_shows("alice") == [
+        {"id": 143, "name": "Breaking Bad"},
+        {"id": 82, "name": "Fringe"},
+    ]
+
+
+def test_migrate_watchlist_leaves_old_rows_in_place(fake_client):
+    storage.add_show("old-token-abc", 82, "Fringe")
+
+    storage.migrate_watchlist("old-token-abc", "alice")
+
+    assert storage.list_shows("old-token-abc") == [{"id": 82, "name": "Fringe"}]
+
+
+def test_migrate_watchlist_merges_into_an_existing_watchlist(fake_client):
+    storage.add_show("old-token-abc", 82, "Fringe")
+    storage.add_show("alice", 143, "Breaking Bad")
+
+    storage.migrate_watchlist("old-token-abc", "alice")
+
+    assert storage.list_shows("alice") == [
+        {"id": 143, "name": "Breaking Bad"},
+        {"id": 82, "name": "Fringe"},
+    ]
+
+
+def test_migrate_watchlist_is_a_noop_when_tokens_match(fake_client):
+    storage.add_show("alice", 82, "Fringe")
+    storage.migrate_watchlist("alice", "alice")
+    assert storage.list_shows("alice") == [{"id": 82, "name": "Fringe"}]
+
+
+def test_migrate_watchlist_stops_at_the_watchlist_cap(fake_client, monkeypatch):
+    storage.add_show("old-token-abc", 82, "Fringe")
+    storage.add_show("old-token-abc", 143, "Breaking Bad")
+
+    monkeypatch.setattr(storage, "MAX_WATCHLIST_SIZE", 1)
+    storage.migrate_watchlist("old-token-abc", "alice")
+
+    assert len(storage.list_shows("alice")) == 1

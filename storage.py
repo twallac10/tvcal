@@ -1,17 +1,20 @@
-"""Watchlist persistence backed by Azure Table Storage.
+"""Watchlist and account persistence backed by Azure Table Storage.
 
-A "watchlist" has no identity of its own beyond its write token: it is
-simply the set of show rows sharing a PartitionKey. The write token is an
-opaque, random, client-generated string -- anyone holding it can view or
-edit that list, so it's kept private to the browser managing the list (URL
-+ localStorage), never embedded in a calendar subscription URL.
+A "watchlist" has no identity of its own beyond its owning token: it is
+simply the set of show rows sharing a PartitionKey. That token is normally
+an account's (lowercased) username -- accounts are the unit of identity now
+(see auth.py), so signing in from any device reaches the same watchlist.
+The legacy shape (a random, client-generated token with no account behind
+it) still works structurally and is what migrate_watchlist() reads from
+when a browser's pre-account watchlist is folded into a new account at
+signup.
 
-The calendar feed instead uses a separate, server-issued *feed token*
+The calendar feed uses a separate, server-issued *feed token*
 (get_or_create_feed_token / resolve_feed_token below) that can only be used
-to read episode data for the watchlist -- never to add/remove shows. This
-way a feed URL leaking (shared calendars, sync logs, browser history on a
-shared device) only exposes what someone is watching, not write access to
-their list.
+to read episode data for the watchlist -- never to add/remove shows, and
+not tied to a login session at all. This way a feed URL leaking (shared
+calendars, sync logs, browser history on a shared device) only exposes what
+someone is watching, not write access to their list.
 """
 from __future__ import annotations
 
@@ -25,14 +28,17 @@ from azure.data.tables import TableServiceClient
 
 TABLE_NAME = "watchlistshows"
 MAX_WATCHLIST_SIZE = 100
+MAX_ACCOUNTS = 10
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 
 # Reserved RowKey (under a watchlist's own PartitionKey) holding that
 # watchlist's feed token, and the PartitionKey used to index feed tokens
-# back to the write token they were issued for. Neither collides with a
-# show's RowKey, which is always a plain integer.
+# back to the token they were issued for. Neither collides with a show's
+# RowKey, which is always a plain integer. Accounts get their own entirely
+# separate reserved partition.
 _META_ROW_KEY = "__meta__"
 _FEED_INDEX_PARTITION = "__feed_index__"
+_ACCOUNTS_PARTITION = "__accounts__"
 
 _table_client_singleton = None
 _table_client_lock = threading.Lock()
@@ -48,6 +54,18 @@ class WatchlistFull(Exception):
 
 class UnknownFeedToken(Exception):
     """Raised when a feed token doesn't resolve to any watchlist."""
+
+
+class UsernameTaken(Exception):
+    """Raised when an account already exists for a given username."""
+
+
+class UnknownAccount(Exception):
+    """Raised when no account exists for a given username."""
+
+
+class TooManyAccounts(Exception):
+    """Raised once MAX_ACCOUNTS accounts already exist."""
 
 
 def validate_token(token: str) -> None:
@@ -151,3 +169,60 @@ def resolve_feed_token(feed_token: str) -> str:
     except ResourceNotFoundError:
         raise UnknownFeedToken("This calendar link is no longer valid.")
     return entity["WriteToken"]
+
+
+def create_account(username: str, password_hash: str, salt: str, iterations: int) -> None:
+    """Create an account record. `username` must already be normalized
+    (lowercased) and validated by the caller (see auth.validate_username)."""
+    validate_token(username)
+    client = _table_client()
+
+    existing = sum(
+        1 for _ in client.query_entities(f"PartitionKey eq '{_ACCOUNTS_PARTITION}'", select=["RowKey"])
+    )
+    if existing >= MAX_ACCOUNTS:
+        raise TooManyAccounts(f"This app already has the maximum of {MAX_ACCOUNTS} accounts.")
+
+    try:
+        client.create_entity(
+            {
+                "PartitionKey": _ACCOUNTS_PARTITION,
+                "RowKey": username,
+                "PasswordHash": password_hash,
+                "Salt": salt,
+                "Iterations": iterations,
+            }
+        )
+    except ResourceExistsError:
+        raise UsernameTaken(f"Username '{username}' is already taken.")
+
+
+def get_account(username: str) -> dict:
+    validate_token(username)
+    client = _table_client()
+    try:
+        entity = client.get_entity(partition_key=_ACCOUNTS_PARTITION, row_key=username)
+    except ResourceNotFoundError:
+        raise UnknownAccount(f"No account for username '{username}'.")
+    return {
+        "password_hash": entity["PasswordHash"],
+        "salt": entity["Salt"],
+        "iterations": entity["Iterations"],
+    }
+
+
+def migrate_watchlist(old_token: str, new_username: str) -> None:
+    """Best-effort copy of shows from a pre-account watchlist token into an
+    account's watchlist (used once at signup to carry a browser's existing
+    list forward). Leaves the old rows in place rather than deleting them --
+    harmless, and safer if something goes wrong partway through.
+    """
+    validate_token(old_token)
+    validate_token(new_username)
+    if old_token == new_username:
+        return
+    for show in list_shows(old_token):
+        try:
+            add_show(new_username, show["id"], show["name"])
+        except WatchlistFull:
+            break
