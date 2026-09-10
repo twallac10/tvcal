@@ -24,27 +24,159 @@ def test_index_does_not_require_a_session():
     assert response.status_code == 200
 
 
-def test_auth_login_sets_cookie_on_correct_password(monkeypatch):
-    monkeypatch.setattr(auth, "check_password", lambda password: password == "right")
-    monkeypatch.setattr(auth, "create_session_cookie", lambda: "tvcal_session=abc; Path=/")
+def test_auth_signup_creates_account_and_sets_cookie(monkeypatch):
+    monkeypatch.setattr(auth, "check_signup_code", lambda code: code == "letmein")
+    monkeypatch.setattr(auth, "create_account", lambda username, password: username.lower())
+    monkeypatch.setattr(
+        auth, "create_session_cookie", lambda username: f"tvcal_session={username}; Path=/"
+    )
 
-    body = json.dumps({"password": "right"}).encode()
+    body = json.dumps(
+        {"username": "Alice", "password": "hunter2pass", "signup_code": "letmein"}
+    ).encode()
+    response = function_app.auth_signup(_request("POST", "auth/signup", body=body))
+
+    assert response.status_code == 204
+    assert response.headers["Set-Cookie"] == "tvcal_session=alice; Path=/"
+
+
+def test_auth_signup_migrates_previous_token_when_given(monkeypatch):
+    monkeypatch.setattr(auth, "check_signup_code", lambda code: True)
+    monkeypatch.setattr(auth, "create_account", lambda username, password: "alice")
+    monkeypatch.setattr(auth, "create_session_cookie", lambda username: "tvcal_session=x; Path=/")
+
+    calls = []
+    monkeypatch.setattr(
+        storage, "migrate_watchlist", lambda old, new: calls.append((old, new))
+    )
+
+    body = json.dumps(
+        {
+            "username": "alice",
+            "password": "hunter2pass",
+            "signup_code": "letmein",
+            "previous_token": "old-browser-token",
+        }
+    ).encode()
+    response = function_app.auth_signup(_request("POST", "auth/signup", body=body))
+
+    assert response.status_code == 204
+    assert calls == [("old-browser-token", "alice")]
+
+
+def test_auth_signup_rejects_wrong_signup_code(monkeypatch):
+    monkeypatch.setattr(auth, "check_signup_code", lambda code: False)
+
+    body = json.dumps(
+        {"username": "alice", "password": "hunter2pass", "signup_code": "wrong"}
+    ).encode()
+    response = function_app.auth_signup(_request("POST", "auth/signup", body=body))
+
+    assert response.status_code == 401
+
+
+def test_auth_signup_rejects_short_password(monkeypatch):
+    monkeypatch.setattr(auth, "check_signup_code", lambda code: True)
+
+    body = json.dumps(
+        {"username": "alice", "password": "short", "signup_code": "letmein"}
+    ).encode()
+    response = function_app.auth_signup(_request("POST", "auth/signup", body=body))
+
+    assert response.status_code == 400
+
+
+def test_auth_signup_rejects_missing_fields():
+    body = json.dumps({"username": "alice"}).encode()
+    response = function_app.auth_signup(_request("POST", "auth/signup", body=body))
+    assert response.status_code == 400
+
+
+def test_auth_signup_returns_500_when_signup_code_unconfigured(monkeypatch):
+    def raise_unconfigured(code):
+        raise auth.AuthConfigError("nope")
+
+    monkeypatch.setattr(auth, "check_signup_code", raise_unconfigured)
+
+    body = json.dumps(
+        {"username": "alice", "password": "hunter2pass", "signup_code": "letmein"}
+    ).encode()
+    response = function_app.auth_signup(_request("POST", "auth/signup", body=body))
+
+    assert response.status_code == 500
+
+
+def test_auth_signup_rejects_invalid_username(monkeypatch):
+    monkeypatch.setattr(auth, "check_signup_code", lambda code: True)
+
+    def raise_invalid(username, password):
+        raise auth.InvalidUsername("bad username")
+
+    monkeypatch.setattr(auth, "create_account", raise_invalid)
+
+    body = json.dumps(
+        {"username": "ab", "password": "hunter2pass", "signup_code": "letmein"}
+    ).encode()
+    response = function_app.auth_signup(_request("POST", "auth/signup", body=body))
+
+    assert response.status_code == 400
+
+
+def test_auth_signup_returns_409_when_username_taken(monkeypatch):
+    monkeypatch.setattr(auth, "check_signup_code", lambda code: True)
+
+    def raise_taken(username, password):
+        raise storage.UsernameTaken("taken")
+
+    monkeypatch.setattr(auth, "create_account", raise_taken)
+
+    body = json.dumps(
+        {"username": "alice", "password": "hunter2pass", "signup_code": "letmein"}
+    ).encode()
+    response = function_app.auth_signup(_request("POST", "auth/signup", body=body))
+
+    assert response.status_code == 409
+
+
+def test_auth_signup_returns_403_when_too_many_accounts(monkeypatch):
+    monkeypatch.setattr(auth, "check_signup_code", lambda code: True)
+
+    def raise_too_many(username, password):
+        raise storage.TooManyAccounts("full")
+
+    monkeypatch.setattr(auth, "create_account", raise_too_many)
+
+    body = json.dumps(
+        {"username": "alice", "password": "hunter2pass", "signup_code": "letmein"}
+    ).encode()
+    response = function_app.auth_signup(_request("POST", "auth/signup", body=body))
+
+    assert response.status_code == 403
+
+
+def test_auth_login_sets_cookie_on_correct_credentials(monkeypatch):
+    monkeypatch.setattr(auth, "verify_login", lambda username, password: password == "right")
+    monkeypatch.setattr(
+        auth, "create_session_cookie", lambda username: f"tvcal_session={username}; Path=/"
+    )
+
+    body = json.dumps({"username": "Alice", "password": "right"}).encode()
     response = function_app.auth_login(_request("POST", "auth/login", body=body))
 
     assert response.status_code == 204
-    assert response.headers["Set-Cookie"] == "tvcal_session=abc; Path=/"
+    assert response.headers["Set-Cookie"] == "tvcal_session=alice; Path=/"
 
 
-def test_auth_login_rejects_wrong_password(monkeypatch):
-    monkeypatch.setattr(auth, "check_password", lambda password: False)
+def test_auth_login_rejects_wrong_credentials(monkeypatch):
+    monkeypatch.setattr(auth, "verify_login", lambda username, password: False)
 
-    body = json.dumps({"password": "wrong"}).encode()
+    body = json.dumps({"username": "alice", "password": "wrong"}).encode()
     response = function_app.auth_login(_request("POST", "auth/login", body=body))
 
     assert response.status_code == 401
 
 
-def test_auth_login_rejects_missing_password():
+def test_auth_login_rejects_missing_fields():
     response = function_app.auth_login(_request("POST", "auth/login", body=b"{}"))
     assert response.status_code == 400
 
@@ -55,12 +187,12 @@ def test_auth_login_rejects_malformed_body():
 
 
 def test_auth_login_returns_500_when_server_auth_unconfigured(monkeypatch):
-    def raise_unconfigured(password):
+    def raise_unconfigured(username, password):
         raise auth.AuthConfigError("nope")
 
-    monkeypatch.setattr(auth, "check_password", raise_unconfigured)
+    monkeypatch.setattr(auth, "verify_login", raise_unconfigured)
 
-    body = json.dumps({"password": "whatever"}).encode()
+    body = json.dumps({"username": "alice", "password": "whatever"}).encode()
     response = function_app.auth_login(_request("POST", "auth/login", body=body))
 
     assert response.status_code == 500
@@ -76,30 +208,26 @@ def test_auth_logout_clears_cookie(monkeypatch):
 
 
 def test_auth_status_reports_authenticated(monkeypatch):
-    monkeypatch.setattr(auth, "is_authenticated", lambda req: True)
+    monkeypatch.setattr(auth, "get_username", lambda req: "alice")
     response = function_app.auth_status(_request("GET", "auth/status"))
-    assert json.loads(response.get_body()) == {"authenticated": True}
+    assert json.loads(response.get_body()) == {"authenticated": True, "username": "alice"}
 
 
 def test_auth_status_reports_unauthenticated(monkeypatch):
-    monkeypatch.setattr(auth, "is_authenticated", lambda req: False)
+    monkeypatch.setattr(auth, "get_username", lambda req: None)
     response = function_app.auth_status(_request("GET", "auth/status"))
-    assert json.loads(response.get_body()) == {"authenticated": False}
+    assert json.loads(response.get_body()) == {"authenticated": False, "username": None}
 
 
 def test_protected_routes_require_a_session(monkeypatch):
     monkeypatch.setattr(auth, "is_authenticated", lambda req: False)
 
     protected = [
-        lambda: function_app.watchlist_get(_request("GET", "watchlist", params={"list": "abc"})),
-        lambda: function_app.watchlist_add(
-            _request("POST", "watchlist", params={"list": "abc"}, body=b"{}")
-        ),
-        lambda: function_app.watchlist_feed_token(
-            _request("GET", "watchlist/feed-token", params={"list": "abc"})
-        ),
+        lambda: function_app.watchlist_get(_request("GET", "watchlist")),
+        lambda: function_app.watchlist_add(_request("POST", "watchlist", body=b"{}")),
+        lambda: function_app.watchlist_feed_token(_request("GET", "watchlist/feed-token")),
         lambda: function_app.watchlist_remove(
-            _request("DELETE", "watchlist/1", params={"list": "abc"}, route_params={"show_id": "1"})
+            _request("DELETE", "watchlist/1", route_params={"show_id": "1"})
         ),
         lambda: function_app.search(_request("GET", "shows/search", params={"q": "fringe"})),
     ]
@@ -129,47 +257,43 @@ def test_search_returns_502_when_tvmaze_result_is_missing_required_fields(monkey
     assert response.status_code == 502
 
 
-def test_watchlist_get_requires_list_param():
+def test_watchlist_get_returns_shows_for_the_signed_in_user(monkeypatch):
+    calls = []
+
+    def fake_list_shows(username):
+        calls.append(username)
+        return [{"id": 82, "name": "Fringe"}]
+
+    monkeypatch.setattr(storage, "list_shows", fake_list_shows)
+
     response = function_app.watchlist_get(_request("GET", "watchlist"))
-    assert response.status_code == 400
-
-
-def test_watchlist_get_returns_shows(monkeypatch):
-    monkeypatch.setattr(storage, "list_shows", lambda token: [{"id": 82, "name": "Fringe"}])
-
-    response = function_app.watchlist_get(_request("GET", "watchlist", params={"list": "abc123"}))
 
     assert response.status_code == 200
     assert json.loads(response.get_body()) == [{"id": 82, "name": "Fringe"}]
+    assert calls == ["testuser"]  # conftest's bypass_auth stubs the session username
 
 
-def test_watchlist_add_calls_storage_with_parsed_body(monkeypatch):
+def test_watchlist_add_calls_storage_with_signed_in_user(monkeypatch):
     calls = []
     monkeypatch.setattr(
-        storage, "add_show", lambda token, show_id, show_name: calls.append((token, show_id, show_name))
+        storage, "add_show", lambda username, show_id, show_name: calls.append((username, show_id, show_name))
     )
 
     body = json.dumps({"show_id": 82, "show_name": "Fringe"}).encode()
-    response = function_app.watchlist_add(
-        _request("POST", "watchlist", params={"list": "abc123"}, body=body)
-    )
+    response = function_app.watchlist_add(_request("POST", "watchlist", body=body))
 
     assert response.status_code == 204
-    assert calls == [("abc123", 82, "Fringe")]
+    assert calls == [("testuser", 82, "Fringe")]
 
 
 def test_watchlist_add_rejects_malformed_body():
-    response = function_app.watchlist_add(
-        _request("POST", "watchlist", params={"list": "abc123"}, body=b"not json")
-    )
+    response = function_app.watchlist_add(_request("POST", "watchlist", body=b"not json"))
     assert response.status_code == 400
 
 
 def test_watchlist_add_rejects_missing_fields():
     body = json.dumps({"show_id": 82}).encode()
-    response = function_app.watchlist_add(
-        _request("POST", "watchlist", params={"list": "abc123"}, body=body)
-    )
+    response = function_app.watchlist_add(_request("POST", "watchlist", body=body))
     assert response.status_code == 400
 
 
@@ -177,17 +301,13 @@ def test_watchlist_add_rejects_boolean_show_id():
     # bool is a subclass of int in Python -- isinstance(True, int) is True --
     # so this must be rejected explicitly or it corrupts the RowKey.
     body = json.dumps({"show_id": True, "show_name": "Fringe"}).encode()
-    response = function_app.watchlist_add(
-        _request("POST", "watchlist", params={"list": "abc123"}, body=body)
-    )
+    response = function_app.watchlist_add(_request("POST", "watchlist", body=body))
     assert response.status_code == 400
 
 
 def test_watchlist_add_rejects_oversized_show_name():
     body = json.dumps({"show_id": 82, "show_name": "x" * 500}).encode()
-    response = function_app.watchlist_add(
-        _request("POST", "watchlist", params={"list": "abc123"}, body=body)
-    )
+    response = function_app.watchlist_add(_request("POST", "watchlist", body=body))
     assert response.status_code == 400
 
 
@@ -195,51 +315,49 @@ def test_watchlist_add_rejects_show_id_too_large_for_table_storage_row_key():
     # Table Storage RowKeys are capped at 1024 chars; anything absurdly large
     # should be rejected with a clean 400 instead of failing inside storage.
     body = json.dumps({"show_id": 10**16, "show_name": "Fringe"}).encode()
-    response = function_app.watchlist_add(
-        _request("POST", "watchlist", params={"list": "abc123"}, body=body)
-    )
+    response = function_app.watchlist_add(_request("POST", "watchlist", body=body))
     assert response.status_code == 400
 
 
 def test_watchlist_add_returns_409_when_watchlist_full(monkeypatch):
-    def raise_full(token, show_id, show_name):
+    def raise_full(username, show_id, show_name):
         raise storage.WatchlistFull("full")
 
     monkeypatch.setattr(storage, "add_show", raise_full)
 
     body = json.dumps({"show_id": 82, "show_name": "Fringe"}).encode()
-    response = function_app.watchlist_add(
-        _request("POST", "watchlist", params={"list": "abc123"}, body=body)
-    )
+    response = function_app.watchlist_add(_request("POST", "watchlist", body=body))
     assert response.status_code == 409
 
 
-def test_watchlist_remove_calls_storage(monkeypatch):
+def test_watchlist_remove_calls_storage_with_signed_in_user(monkeypatch):
     calls = []
-    monkeypatch.setattr(storage, "remove_show", lambda token, show_id: calls.append((token, show_id)))
+    monkeypatch.setattr(
+        storage, "remove_show", lambda username, show_id: calls.append((username, show_id))
+    )
 
     response = function_app.watchlist_remove(
-        _request("DELETE", "watchlist/82", params={"list": "abc123"}, route_params={"show_id": "82"})
+        _request("DELETE", "watchlist/82", route_params={"show_id": "82"})
     )
 
     assert response.status_code == 204
-    assert calls == [("abc123", 82)]
+    assert calls == [("testuser", 82)]
 
 
-def test_watchlist_feed_token_requires_list_param():
+def test_watchlist_feed_token_returns_storage_value_for_signed_in_user(monkeypatch):
+    calls = []
+
+    def fake_get_or_create_feed_token(username):
+        calls.append(username)
+        return "feed-tok-123"
+
+    monkeypatch.setattr(storage, "get_or_create_feed_token", fake_get_or_create_feed_token)
+
     response = function_app.watchlist_feed_token(_request("GET", "watchlist/feed-token"))
-    assert response.status_code == 400
-
-
-def test_watchlist_feed_token_returns_storage_value(monkeypatch):
-    monkeypatch.setattr(storage, "get_or_create_feed_token", lambda token: "feed-tok-123")
-
-    response = function_app.watchlist_feed_token(
-        _request("GET", "watchlist/feed-token", params={"list": "abc123"})
-    )
 
     assert response.status_code == 200
     assert json.loads(response.get_body()) == {"feed_token": "feed-tok-123"}
+    assert calls == ["testuser"]
 
 
 def test_calendar_feed_requires_feed_or_show_ids():

@@ -9,51 +9,67 @@ Open the Function App's root URL for the UI, or use the HTTP API directly.
 
 ## Signing in
 
-The UI and its write API (search, watchlist add/remove, feed-token issuance)
-sit behind a single shared password — there's no per-user account system,
-just a login wall so a stumbled-upon URL is useless without it. Sign in once
-at `/`; a session cookie (HttpOnly, 30 days) keeps you logged in after that,
-with a "Log out" button to end it early.
+Real (if lightweight) accounts: each person signs up with their own
+username and password, so signing in from any device reaches the same
+watchlist — no more per-browser tokens to copy around. There's still no
+external identity provider; accounts live in Table Storage with
+PBKDF2-hashed passwords (per-account salt, never stored in plaintext).
+
+Self-serve signup at `/` (the "Need an account? Sign up" link) is gated by
+a shared **invite code** — the `SIGNUP_CODE` app setting — so it's still
+just the people you give the code to who can create an account, not the
+whole internet; `storage.MAX_ACCOUNTS` (10) is a hard backstop on top of
+that. Share the code with whoever should get an account, then consider
+rotating/blanking `SIGNUP_CODE` once everyone who needs one has signed up.
+
+A session cookie (HttpOnly, 30 days) keeps you signed in after that, with a
+"Log out" button to end it early. If your browser already has a watchlist
+under the old pre-account scheme (a `tvcal_list_token` in localStorage from
+before you had an account), signing up automatically folds those shows into
+your new account, once — nothing is lost.
 
 `/calendar.ics` is deliberately **not** behind this login: calendar apps
 fetch that URL directly with no cookies at all, so it's gated only by its
 own read-only feed token instead (see below) — that's the whole reason the
-write and feed tokens are separate.
-
-The password is never stored in plaintext — only its SHA-256 hash, as the
-`ACCESS_PASSWORD_HASH` app setting (see **Deploying to Azure** below for how
-to set it). To change the password, generate a new hash and update that
-setting; existing sessions stay valid until they expire since they're only
-signed with `SESSION_SECRET`, not tied to the password itself.
+feed token exists separately from your login.
 
 ## How watchlists work
 
-There's no login. Each watchlist has two separate tokens:
+A watchlist belongs to an account (see **Signing in**) — sign in from any
+device and you're looking at the same list. Each watchlist also has its own
+**feed token** — opaque and server-issued, fetched once via
+`GET /watchlist/feed-token` — that can only be used to read the calendar
+feed, never to add or remove shows. That's what actually goes in the
+`.ics` subscription URL.
 
-- A **write token** — an opaque UUID generated in the browser and kept in
-  the URL/localStorage (`?list=<token>`) — that can view and edit the
-  watchlist. Treat it like a lightweight password to your list; bookmarking
-  its URL gets you back to the same watchlist.
-- A **feed token** — opaque and server-issued, fetched once via
-  `GET /watchlist/feed-token` — that can only be used to read the calendar
-  feed. It's what actually goes in the `.ics` subscription URL.
-
-They're deliberately different tokens so that pasting the calendar URL into
-Google/Apple/Outlook (which store and periodically re-fetch it, and which
-you might share a calendar containing it) never hands out edit access to
-the watchlist — only the write token, which never leaves the management
-UI, can add or remove shows.
+The feed token is deliberately separate from your login so that pasting the
+calendar URL into Google/Apple/Outlook (which store and periodically
+re-fetch it, and which you might share a calendar containing it) never
+hands out edit access to your watchlist — only signing in with your
+username and password can add or remove shows.
 
 The calendar URL built from a feed token (`/calendar.ics?feed=<token>`)
-stays stable as you add or remove shows via the write token — subscribe
-once in your calendar app and it keeps updating.
+stays stable as you add or remove shows — subscribe once in your calendar
+app and it keeps updating.
 
 ## Endpoints
 
-Every endpoint below except `/calendar.ics` requires a valid session cookie
-(see **Signing in**) — `POST /auth/login` with `{"password": "..."}` sets
-one, `POST /auth/logout` clears it, `GET /auth/status` reports
-`{"authenticated": bool}` for the current cookie.
+Every endpoint below except `/`, `/auth/*`, and `/calendar.ics` requires a
+valid session cookie (see **Signing in**).
+
+- `POST /auth/signup` — body `{"username", "password", "signup_code", "previous_token"?}`.
+  Creates an account (`password` must be 8+ characters, `username` 3-50
+  characters of letters/digits/`-`/`_`) and signs you in. `previous_token`
+  is optional — a pre-account browser's `tvcal_list_token`, folded into the
+  new account if given. It's silently ignored (no shows copied, signup
+  still succeeds) if it matches another real account's username, so it
+  can't be used to pull someone else's watchlist into your new account.
+  `409` if the username's taken, `401` for a wrong `signup_code`, `403`
+  once `MAX_ACCOUNTS` is reached.
+- `POST /auth/login` — body `{"username", "password"}`. Sets the session cookie.
+- `POST /auth/logout` — clears the session cookie.
+- `GET /auth/status` — `{"authenticated": bool, "username": str | null}` for
+  the current cookie.
 
 ### `GET /shows/search?q=<name>`
 
@@ -77,23 +93,24 @@ GET /shows/search?q=fringe
 ]
 ```
 
-### `GET /watchlist?list=<token>`
+### `GET /watchlist`
 
-Returns the shows currently on that watchlist: `[{"id": 82, "name": "Fringe"}, ...]`.
+Returns the shows on your watchlist: `[{"id": 82, "name": "Fringe"}, ...]`.
 
-### `POST /watchlist?list=<token>`
+### `POST /watchlist`
 
 Body: `{"show_id": 82, "show_name": "Fringe"}`. Adds (or re-adds) a show.
 `204 No Content` on success. `409 Conflict` once a watchlist hits 100 shows.
 
-### `DELETE /watchlist/{show_id}?list=<token>`
+### `DELETE /watchlist/{show_id}`
 
-Removes a show from the watchlist. `204 No Content` on success (idempotent).
+Removes a show from your watchlist. `204 No Content` on success (idempotent).
 
-### `GET /watchlist/feed-token?list=<token>`
+### `GET /watchlist/feed-token`
 
-Returns (creating on first call) the read-only feed token for a watchlist:
-`{"feed_token": "..."}`. Idempotent — repeat calls return the same token.
+Returns (creating on first call) the read-only feed token for your
+watchlist: `{"feed_token": "..."}`. Idempotent — repeat calls return the
+same token.
 
 ### `GET /calendar.ics?feed=<feed_token>` or `?show_ids=<id,id,...>`
 
@@ -130,14 +147,17 @@ azurite --silent --location .azurite &
 func start
 ```
 
-Then open `http://localhost:7071/` for the UI and sign in with `changeme`
-(the password baked into `local.settings.json.example` — see **Signing in**
-above; fine for local dev, never use it in production). Signed-in API calls
-need the session cookie, so for `curl` either drive it through a cookie jar:
+Then open `http://localhost:7071/` for the UI, click "Need an account? Sign
+up", and use invite code `changeme` (the value baked into
+`local.settings.json.example` — see **Signing in** above; fine for local
+dev, never use it in production) to create yourself an account. Signed-in
+API calls need the session cookie, so for `curl` either sign up/in through a
+cookie jar:
 
 ```bash
-curl -c /tmp/tvcal-cookies -X POST http://localhost:7071/auth/login \
-  -H "Content-Type: application/json" -d '{"password":"changeme"}'
+curl -c /tmp/tvcal-cookies -X POST http://localhost:7071/auth/signup \
+  -H "Content-Type: application/json" \
+  -d '{"username":"me","password":"a-real-password","signup_code":"changeme"}'
 curl -b /tmp/tvcal-cookies "http://localhost:7071/shows/search?q=fringe"
 ```
 
@@ -181,16 +201,18 @@ az functionapp create \
 # at the bare root URL by default, which overrides the UI's route="/" function
 # even though it's registered correctly. This setting disables that.
 #
-# ACCESS_PASSWORD_HASH/SESSION_SECRET gate the app behind a login -- see
-# "Signing in" above. Generate real values, don't reuse the example ones:
-#   python3 -c "import hashlib; print(hashlib.sha256(b'<your password>').hexdigest())"
-#   python3 -c "import secrets; print(secrets.token_hex(32))"
+# SIGNUP_CODE is the invite code people need to create an account (share it
+# out-of-band with them, then consider rotating/blanking it once everyone
+# who needs an account has one). SESSION_SECRET signs session cookies.
+# Generate real values, don't reuse the local-dev example ones:
+#   python3 -c "import secrets; print(secrets.token_urlsafe(16))"   # SIGNUP_CODE
+#   python3 -c "import secrets; print(secrets.token_hex(32))"       # SESSION_SECRET
 az functionapp config appsettings set \
   --resource-group <resource-group> \
   --name <function-app-name> \
   --settings \
     AzureWebJobsDisableHomepage=true \
-    ACCESS_PASSWORD_HASH=<sha256 hash from above> \
+    SIGNUP_CODE=<value from above> \
     SESSION_SECRET=<random hex from above>
 
 func azure functionapp publish <function-app-name> --python
@@ -200,18 +222,29 @@ Beyond the ones Azure Functions provisions automatically
 (`AzureWebJobsStorage`, `FUNCTIONS_WORKER_RUNTIME`), the required app
 settings are the three above: `AzureWebJobsDisableHomepage=true` (without it
 the UI at `/` is shadowed by Azure's default placeholder page even though
-every other route works), and `ACCESS_PASSWORD_HASH`/`SESSION_SECRET` (the
-login gate — without them, every session-gated route fails closed and
-nobody can sign in at all). `AzureWebJobsStorage` is also where the
-watchlist table lives — no separate storage account needed beyond the one
-linked at creation.
+every other route works), `SIGNUP_CODE` (without it nobody can create an
+account), and `SESSION_SECRET` (signs session cookies — without it every
+session-gated route fails closed). `AzureWebJobsStorage` is also where the
+watchlist and account tables live — no separate storage account needed
+beyond the one linked at creation.
+
+After the first account or two are created, consider rotating `SIGNUP_CODE`
+to something only you know (or blanking it, which makes signup fail closed)
+so the invite code can't be reused by someone who found it once:
+
+```bash
+az functionapp config appsettings set \
+  --resource-group <resource-group> \
+  --name <function-app-name> \
+  --settings SIGNUP_CODE=<new value>
+```
 
 ## Project layout
 
 - `function_app.py` — HTTP-triggered functions (UI, auth, search, watchlist, calendar feed)
-- `auth.py` — the shared-password login gate (session cookies, no external identity provider)
+- `auth.py` — account login (PBKDF2 password hashing, signup-code-gated signup, session cookies, no external identity provider)
 - `tvmaze_client.py` — thin wrapper around the TVMaze REST API
 - `ical_builder.py` — builds the `.ics` calendar from TVMaze show/episode data
-- `storage.py` — watchlist persistence in Azure Table Storage
+- `storage.py` — watchlist and account persistence in Azure Table Storage
 - `static/index.html` — the login + search + watchlist single-page UI
 - `tests/` — unit tests (mocked TVMaze/Table Storage, no network calls)
