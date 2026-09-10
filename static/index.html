@@ -150,12 +150,12 @@
       <input type="text" id="feed-url" readonly>
       <button type="button" id="copy-btn" class="secondary">Copy</button>
     </div>
-    <p class="hint">Paste this URL into Google Calendar, Apple Calendar, or Outlook as a subscription (not a one-time import). It always reflects your current watchlist.</p>
+    <p class="hint">Paste this URL into Google Calendar, Apple Calendar, or Outlook as a subscription (not a one-time import). It always reflects your current watchlist. This link is read-only -- anyone who has it can see your episode schedule but can't change your watchlist.</p>
   </section>
 </main>
 
 <script>
-  const state = { token: null, watchlist: [] };
+  const state = { token: null, feedToken: null, watchlist: [] };
 
   function getOrCreateToken() {
     const url = new URL(location.href);
@@ -177,12 +177,26 @@
     const res = await fetch(`/watchlist?list=${encodeURIComponent(state.token)}`);
     state.watchlist = res.ok ? await res.json() : [];
     renderWatchlist();
+
+    if (!state.feedToken) {
+      await loadFeedToken();
+    } else {
+      renderFeedUrl();
+    }
+  }
+
+  async function loadFeedToken() {
+    const res = await fetch(`/watchlist/feed-token?list=${encodeURIComponent(state.token)}`);
+    if (res.ok) {
+      state.feedToken = (await res.json()).feed_token;
+    }
     renderFeedUrl();
   }
 
   function renderFeedUrl() {
-    document.getElementById("feed-url").value =
-      `${location.origin}/calendar.ics?list=${encodeURIComponent(state.token)}`;
+    document.getElementById("feed-url").value = state.feedToken
+      ? `${location.origin}/calendar.ics?feed=${encodeURIComponent(state.feedToken)}`
+      : "";
   }
 
   function renderWatchlist() {

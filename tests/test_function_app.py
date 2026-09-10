@@ -124,9 +124,46 @@ def test_watchlist_remove_calls_storage(monkeypatch):
     assert calls == [("abc123", 82)]
 
 
-def test_calendar_feed_requires_list_or_show_ids():
+def test_watchlist_feed_token_requires_list_param():
+    response = function_app.watchlist_feed_token(_request("GET", "watchlist/feed-token"))
+    assert response.status_code == 400
+
+
+def test_watchlist_feed_token_returns_storage_value(monkeypatch):
+    monkeypatch.setattr(storage, "get_or_create_feed_token", lambda token: "feed-tok-123")
+
+    response = function_app.watchlist_feed_token(
+        _request("GET", "watchlist/feed-token", params={"list": "abc123"})
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.get_body()) == {"feed_token": "feed-tok-123"}
+
+
+def test_calendar_feed_requires_feed_or_show_ids():
     response = function_app.calendar_feed(_request("GET", "calendar.ics"))
     assert response.status_code == 400
+
+
+def test_calendar_feed_write_token_alone_is_rejected(monkeypatch):
+    # The old ?list=<write_token> shape must not work for the calendar feed
+    # -- that would defeat the whole point of splitting read/write tokens.
+    monkeypatch.setattr(storage, "list_shows", lambda token: [{"id": 82, "name": "Fringe"}])
+
+    response = function_app.calendar_feed(_request("GET", "calendar.ics", params={"list": "abc123"}))
+
+    assert response.status_code == 400
+
+
+def test_calendar_feed_rejects_unknown_feed_token(monkeypatch):
+    def raise_unknown(feed_token):
+        raise storage.UnknownFeedToken("nope")
+
+    monkeypatch.setattr(storage, "resolve_feed_token", raise_unknown)
+
+    response = function_app.calendar_feed(_request("GET", "calendar.ics", params={"feed": "bogus"}))
+
+    assert response.status_code == 404
 
 
 _PILOT_EPISODE = {
@@ -139,7 +176,18 @@ _PILOT_EPISODE = {
 }
 
 
-def test_calendar_feed_builds_events_from_watchlist_token(monkeypatch):
+def _use_feed_token(monkeypatch, feed_token="feed-tok", write_token="abc123"):
+    def fake_resolve_feed_token(token):
+        if token != feed_token:
+            raise storage.UnknownFeedToken("nope")
+        return write_token
+
+    monkeypatch.setattr(storage, "resolve_feed_token", fake_resolve_feed_token)
+    return feed_token
+
+
+def test_calendar_feed_builds_events_from_feed_token(monkeypatch):
+    feed_token = _use_feed_token(monkeypatch)
     monkeypatch.setattr(storage, "list_shows", lambda token: [{"id": 82, "name": "Fringe"}])
     monkeypatch.setattr(
         function_app,
@@ -147,16 +195,17 @@ def test_calendar_feed_builds_events_from_watchlist_token(monkeypatch):
         lambda show_id: ({"id": 82, "name": "Fringe", "runtime": 60}, [_PILOT_EPISODE]),
     )
 
-    response = function_app.calendar_feed(_request("GET", "calendar.ics", params={"list": "abc123"}))
+    response = function_app.calendar_feed(_request("GET", "calendar.ics", params={"feed": feed_token}))
 
     assert response.status_code == 200
     assert b"Fringe - S01E01 - Pilot" in response.get_body()
 
 
 def test_calendar_feed_empty_watchlist_returns_empty_calendar(monkeypatch):
+    feed_token = _use_feed_token(monkeypatch)
     monkeypatch.setattr(storage, "list_shows", lambda token: [])
 
-    response = function_app.calendar_feed(_request("GET", "calendar.ics", params={"list": "abc123"}))
+    response = function_app.calendar_feed(_request("GET", "calendar.ics", params={"feed": feed_token}))
 
     assert response.status_code == 200
     assert b"BEGIN:VCALENDAR" in response.get_body()
@@ -164,6 +213,7 @@ def test_calendar_feed_empty_watchlist_returns_empty_calendar(monkeypatch):
 
 
 def test_calendar_feed_skips_a_broken_show_but_keeps_the_rest(monkeypatch):
+    feed_token = _use_feed_token(monkeypatch)
     monkeypatch.setattr(
         storage,
         "list_shows",
@@ -177,13 +227,14 @@ def test_calendar_feed_skips_a_broken_show_but_keeps_the_rest(monkeypatch):
 
     monkeypatch.setattr(function_app, "get_show_with_episodes", fake_get_show_with_episodes)
 
-    response = function_app.calendar_feed(_request("GET", "calendar.ics", params={"list": "abc123"}))
+    response = function_app.calendar_feed(_request("GET", "calendar.ics", params={"feed": feed_token}))
 
     assert response.status_code == 200
     assert b"Fringe - S01E01 - Pilot" in response.get_body()
 
 
 def test_calendar_feed_concurrent_fetch_isolates_multiple_failures(monkeypatch):
+    feed_token = _use_feed_token(monkeypatch)
     good_ids = {82, 143, 144}
     bad_ids = {999, 1000}
     monkeypatch.setattr(
@@ -201,7 +252,7 @@ def test_calendar_feed_concurrent_fetch_isolates_multiple_failures(monkeypatch):
 
     monkeypatch.setattr(function_app, "get_show_with_episodes", fake_get_show_with_episodes)
 
-    response = function_app.calendar_feed(_request("GET", "calendar.ics", params={"list": "abc123"}))
+    response = function_app.calendar_feed(_request("GET", "calendar.ics", params={"feed": feed_token}))
     body = response.get_body()
 
     assert response.status_code == 200

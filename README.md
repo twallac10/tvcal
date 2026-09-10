@@ -10,16 +10,25 @@ Open the Function App's root URL for the UI, or use the HTTP API directly.
 
 ## How watchlists work
 
-There's no login. Each watchlist is identified by an opaque, random token
-(a UUID generated in the browser and kept in the URL/localStorage) — anyone
-holding the token can view or edit that list, the same trust model as an
-unguessable calendar subscription link. The UI creates a token on first
-visit and appends it to the page URL (`?list=<token>`), so bookmarking that
-URL gets you back to the same watchlist.
+There's no login. Each watchlist has two separate tokens:
 
-The calendar URL built from a token (`/calendar.ics?list=<token>`) stays
-stable as you add or remove shows — subscribe once in your calendar app and
-it keeps updating.
+- A **write token** — an opaque UUID generated in the browser and kept in
+  the URL/localStorage (`?list=<token>`) — that can view and edit the
+  watchlist. Treat it like a lightweight password to your list; bookmarking
+  its URL gets you back to the same watchlist.
+- A **feed token** — opaque and server-issued, fetched once via
+  `GET /watchlist/feed-token` — that can only be used to read the calendar
+  feed. It's what actually goes in the `.ics` subscription URL.
+
+They're deliberately different tokens so that pasting the calendar URL into
+Google/Apple/Outlook (which store and periodically re-fetch it, and which
+you might share a calendar containing it) never hands out edit access to
+the watchlist — only the write token, which never leaves the management
+UI, can add or remove shows.
+
+The calendar URL built from a feed token (`/calendar.ics?feed=<token>`)
+stays stable as you add or remove shows via the write token — subscribe
+once in your calendar app and it keeps updating.
 
 ## Endpoints
 
@@ -58,15 +67,21 @@ Body: `{"show_id": 82, "show_name": "Fringe"}`. Adds (or re-adds) a show.
 
 Removes a show from the watchlist. `204 No Content` on success (idempotent).
 
-### `GET /calendar.ics?list=<token>` or `?show_ids=<id,id,...>`
+### `GET /watchlist/feed-token?list=<token>`
+
+Returns (creating on first call) the read-only feed token for a watchlist:
+`{"feed_token": "..."}`. Idempotent — repeat calls return the same token.
+
+### `GET /calendar.ics?feed=<feed_token>` or `?show_ids=<id,id,...>`
 
 Returns an `.ics` feed with one event per aired/upcoming episode. Use
-`list=<token>` for a stable, auto-updating feed tied to a watchlist, or
-`show_ids=82,143` (max 50 IDs) for a one-off feed built from specific TVMaze
-show IDs without going through the watchlist at all.
+`feed=<feed_token>` (from `GET /watchlist/feed-token`) for a stable,
+auto-updating feed tied to a watchlist, or `show_ids=82,143` (max 50 IDs)
+for a one-off feed built from specific TVMaze show IDs without going
+through a watchlist at all.
 
 ```
-GET /calendar.ics?list=9f2c6e2a-3b34-4b1a-9a2b-3a0d9d7b6b2a
+GET /calendar.ics?feed=RmVlZFRva2VuRXhhbXBsZQ
 ```
 
 Each event's summary is `<Show> - S01E01 - <Episode Title>`, timed at the

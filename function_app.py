@@ -107,6 +107,28 @@ def watchlist_add(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(status_code=204)
 
 
+@app.route(route="watchlist/feed-token", methods=["GET"])
+def watchlist_feed_token(req: func.HttpRequest) -> func.HttpResponse:
+    """GET /watchlist/feed-token?list=<token> -> the read-only calendar feed token.
+
+    This token (not the write token above) is what belongs in a calendar
+    subscription URL: it can only be used to read episode air dates, never
+    to add or remove shows, so leaking it doesn't expose write access.
+    """
+    token = req.params.get("list")
+    if not token:
+        return func.HttpResponse("Query parameter 'list' is required.", status_code=400)
+
+    try:
+        feed_token = storage.get_or_create_feed_token(token)
+    except storage.InvalidListToken as exc:
+        return func.HttpResponse(str(exc), status_code=400)
+
+    return func.HttpResponse(
+        json.dumps({"feed_token": feed_token}), status_code=200, mimetype="application/json"
+    )
+
+
 @app.route(route="watchlist/{show_id}", methods=["DELETE"])
 def watchlist_remove(req: func.HttpRequest) -> func.HttpResponse:
     """DELETE /watchlist/{show_id}?list=<token> -> remove a show from the watchlist."""
@@ -129,22 +151,27 @@ def watchlist_remove(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="calendar.ics", methods=["GET"])
 def calendar_feed(req: func.HttpRequest) -> func.HttpResponse:
-    """GET /calendar.ics?list=<token> or ?show_ids=<id,id,...> -> iCal feed.
+    """GET /calendar.ics?feed=<feed_token> or ?show_ids=<id,id,...> -> iCal feed.
 
     The URL is meant to be pasted straight into a calendar app (Google
     Calendar, Apple Calendar, Outlook, ...) as a subscription so new episodes
     show up automatically as TVMaze publishes air dates. When built from a
-    watchlist token, the same URL keeps working as shows are added/removed --
-    no need to re-subscribe.
+    feed token (see GET /watchlist/feed-token), the same URL keeps working
+    as shows are added/removed -- no need to re-subscribe. The feed token is
+    read-only by design -- it is not the watchlist's write token, so it
+    can't be used to add or remove shows even if the URL leaks.
     """
-    list_token = req.params.get("list")
+    feed_token = req.params.get("feed")
     raw_ids = req.params.get("show_ids")
 
-    if list_token:
+    if feed_token:
         try:
-            show_ids = [show["id"] for show in storage.list_shows(list_token)]
+            write_token = storage.resolve_feed_token(feed_token)
+            show_ids = [show["id"] for show in storage.list_shows(write_token)]
         except storage.InvalidListToken as exc:
             return func.HttpResponse(str(exc), status_code=400)
+        except storage.UnknownFeedToken as exc:
+            return func.HttpResponse(str(exc), status_code=404)
     elif raw_ids:
         try:
             show_ids = list(
@@ -163,7 +190,7 @@ def calendar_feed(req: func.HttpRequest) -> func.HttpResponse:
             )
     else:
         return func.HttpResponse(
-            "Query parameter 'list' (watchlist token) or 'show_ids' is required.",
+            "Query parameter 'feed' (calendar feed token) or 'show_ids' is required.",
             status_code=400,
         )
 
