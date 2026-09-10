@@ -1,19 +1,34 @@
 # tvcal
 
-Find TV shows and subscribe to an iCal feed of their episode air dates, backed
-by the [TVMaze API](https://www.tvmaze.com/api). Ships as a Python Azure
-Functions app with two HTTP endpoints — no database, no auth, nothing to
-provision besides the Function App itself.
+Find TV shows, build a watchlist, and subscribe to one iCal feed of episode
+air dates — backed by the [TVMaze API](https://www.tvmaze.com/api). Ships as
+a single Python Azure Functions app: HTTP API plus a small static UI, backed
+by Azure Table Storage for the watchlist. No separate hosting, no
+authentication system to build.
+
+Open the Function App's root URL for the UI, or use the HTTP API directly.
+
+## How watchlists work
+
+There's no login. Each watchlist is identified by an opaque, random token
+(a UUID generated in the browser and kept in the URL/localStorage) — anyone
+holding the token can view or edit that list, the same trust model as an
+unguessable calendar subscription link. The UI creates a token on first
+visit and appends it to the page URL (`?list=<token>`), so bookmarking that
+URL gets you back to the same watchlist.
+
+The calendar URL built from a token (`/calendar.ics?list=<token>`) stays
+stable as you add or remove shows — subscribe once in your calendar app and
+it keeps updating.
 
 ## Endpoints
 
-### `GET /api/shows/search?q=<name>`
+### `GET /shows/search?q=<name>`
 
-Search TVMaze for shows by name. Returns JSON with each show's TVMaze `id`,
-which you need for the calendar feed.
+Search TVMaze for shows by name.
 
 ```
-GET /api/shows/search?q=fringe
+GET /shows/search?q=fringe
 ```
 
 ```json
@@ -30,15 +45,28 @@ GET /api/shows/search?q=fringe
 ]
 ```
 
-### `GET /api/calendar.ics?show_ids=<id,id,...>`
+### `GET /watchlist?list=<token>`
 
-Returns an `.ics` feed with one event per aired/upcoming episode across all
-listed shows (comma-separated TVMaze show IDs). Paste this URL into Google
-Calendar, Apple Calendar, or Outlook as a **subscription** (not a one-time
-import) so new episodes appear automatically as TVMaze publishes air dates.
+Returns the shows currently on that watchlist: `[{"id": 82, "name": "Fringe"}, ...]`.
+
+### `POST /watchlist?list=<token>`
+
+Body: `{"show_id": 82, "show_name": "Fringe"}`. Adds (or re-adds) a show.
+`204 No Content` on success.
+
+### `DELETE /watchlist/{show_id}?list=<token>`
+
+Removes a show from the watchlist. `204 No Content` on success (idempotent).
+
+### `GET /calendar.ics?list=<token>` or `?show_ids=<id,id,...>`
+
+Returns an `.ics` feed with one event per aired/upcoming episode. Use
+`list=<token>` for a stable, auto-updating feed tied to a watchlist, or
+`show_ids=82,143` for a one-off feed built from specific TVMaze show IDs
+without going through the watchlist at all.
 
 ```
-GET /api/calendar.ics?show_ids=82,143
+GET /calendar.ics?list=9f2c6e2a-3b34-4b1a-9a2b-3a0d9d7b6b2a
 ```
 
 Each event's summary is `<Show> - S01E01 - <Episode Title>`, timed at the
@@ -46,22 +74,27 @@ episode's air date/time with a duration from the episode (or show) runtime.
 
 ## Running locally
 
-Requires [Azure Functions Core Tools v4](https://learn.microsoft.com/azure/azure-functions/functions-run-local)
-and Python 3.10+.
+Requires [Azure Functions Core Tools v4](https://learn.microsoft.com/azure/azure-functions/functions-run-local),
+Python 3.10+, and [Azurite](https://learn.microsoft.com/azure/storage/common/storage-use-azurite)
+(the watchlist uses Azure Table Storage; Azurite emulates it locally).
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-dev.txt
 cp local.settings.json.example local.settings.json
+
+# in a separate terminal: start the storage emulator
+azurite --silent --location .azurite &
+
 func start
 ```
 
-Then try:
+Then open `http://localhost:7071/` for the UI, or:
 
 ```bash
-curl "http://localhost:7071/api/shows/search?q=fringe"
-curl "http://localhost:7071/api/calendar.ics?show_ids=82"
+curl "http://localhost:7071/shows/search?q=fringe"
+curl "http://localhost:7071/calendar.ics?show_ids=82"
 ```
 
 ## Tests
@@ -70,6 +103,9 @@ curl "http://localhost:7071/api/calendar.ics?show_ids=82"
 pip install -r requirements-dev.txt
 pytest
 ```
+
+Tests mock TVMaze and Table Storage, so `pytest` doesn't require Azurite or
+network access.
 
 ## Deploying to Azure
 
@@ -89,10 +125,14 @@ func azure functionapp publish <function-app-name>
 
 The app has no required app settings beyond the ones Azure Functions
 provisions automatically (`AzureWebJobsStorage`, `FUNCTIONS_WORKER_RUNTIME`).
+`AzureWebJobsStorage` is also where the watchlist table lives — no separate
+storage account needed.
 
 ## Project layout
 
-- `function_app.py` — HTTP-triggered functions (search, calendar feed)
+- `function_app.py` — HTTP-triggered functions (UI, search, watchlist, calendar feed)
 - `tvmaze_client.py` — thin wrapper around the TVMaze REST API
 - `ical_builder.py` — builds the `.ics` calendar from TVMaze show/episode data
-- `tests/` — unit tests (mocked TVMaze responses, no network calls)
+- `storage.py` — watchlist persistence in Azure Table Storage
+- `static/index.html` — the search + watchlist single-page UI
+- `tests/` — unit tests (mocked TVMaze/Table Storage, no network calls)
