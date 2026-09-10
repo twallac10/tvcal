@@ -2,6 +2,7 @@ import json
 
 import azure.functions as func
 
+import auth
 import function_app
 import storage
 from tvmaze_client import TVMazeError
@@ -15,6 +16,107 @@ def _request(method, route, params=None, route_params=None, body=b""):
         route_params=route_params or {},
         body=body,
     )
+
+
+def test_index_does_not_require_a_session():
+    # Has to be reachable logged-out -- it's what renders the login form.
+    response = function_app.index(_request("GET", ""))
+    assert response.status_code == 200
+
+
+def test_auth_login_sets_cookie_on_correct_password(monkeypatch):
+    monkeypatch.setattr(auth, "check_password", lambda password: password == "right")
+    monkeypatch.setattr(auth, "create_session_cookie", lambda: "tvcal_session=abc; Path=/")
+
+    body = json.dumps({"password": "right"}).encode()
+    response = function_app.auth_login(_request("POST", "auth/login", body=body))
+
+    assert response.status_code == 204
+    assert response.headers["Set-Cookie"] == "tvcal_session=abc; Path=/"
+
+
+def test_auth_login_rejects_wrong_password(monkeypatch):
+    monkeypatch.setattr(auth, "check_password", lambda password: False)
+
+    body = json.dumps({"password": "wrong"}).encode()
+    response = function_app.auth_login(_request("POST", "auth/login", body=body))
+
+    assert response.status_code == 401
+
+
+def test_auth_login_rejects_missing_password():
+    response = function_app.auth_login(_request("POST", "auth/login", body=b"{}"))
+    assert response.status_code == 400
+
+
+def test_auth_login_rejects_malformed_body():
+    response = function_app.auth_login(_request("POST", "auth/login", body=b"not json"))
+    assert response.status_code == 400
+
+
+def test_auth_login_returns_500_when_server_auth_unconfigured(monkeypatch):
+    def raise_unconfigured(password):
+        raise auth.AuthConfigError("nope")
+
+    monkeypatch.setattr(auth, "check_password", raise_unconfigured)
+
+    body = json.dumps({"password": "whatever"}).encode()
+    response = function_app.auth_login(_request("POST", "auth/login", body=body))
+
+    assert response.status_code == 500
+
+
+def test_auth_logout_clears_cookie(monkeypatch):
+    monkeypatch.setattr(auth, "clear_session_cookie", lambda: "tvcal_session=; Max-Age=0")
+
+    response = function_app.auth_logout(_request("POST", "auth/logout"))
+
+    assert response.status_code == 204
+    assert response.headers["Set-Cookie"] == "tvcal_session=; Max-Age=0"
+
+
+def test_auth_status_reports_authenticated(monkeypatch):
+    monkeypatch.setattr(auth, "is_authenticated", lambda req: True)
+    response = function_app.auth_status(_request("GET", "auth/status"))
+    assert json.loads(response.get_body()) == {"authenticated": True}
+
+
+def test_auth_status_reports_unauthenticated(monkeypatch):
+    monkeypatch.setattr(auth, "is_authenticated", lambda req: False)
+    response = function_app.auth_status(_request("GET", "auth/status"))
+    assert json.loads(response.get_body()) == {"authenticated": False}
+
+
+def test_protected_routes_require_a_session(monkeypatch):
+    monkeypatch.setattr(auth, "is_authenticated", lambda req: False)
+
+    protected = [
+        lambda: function_app.watchlist_get(_request("GET", "watchlist", params={"list": "abc"})),
+        lambda: function_app.watchlist_add(
+            _request("POST", "watchlist", params={"list": "abc"}, body=b"{}")
+        ),
+        lambda: function_app.watchlist_feed_token(
+            _request("GET", "watchlist/feed-token", params={"list": "abc"})
+        ),
+        lambda: function_app.watchlist_remove(
+            _request("DELETE", "watchlist/1", params={"list": "abc"}, route_params={"show_id": "1"})
+        ),
+        lambda: function_app.search(_request("GET", "shows/search", params={"q": "fringe"})),
+    ]
+    for call in protected:
+        assert call().status_code == 401
+
+
+def test_calendar_feed_does_not_require_a_session(monkeypatch):
+    # Calendar apps fetch this URL directly with no cookies -- it must stay
+    # reachable without a session, gated only by its own feed token.
+    monkeypatch.setattr(auth, "is_authenticated", lambda req: False)
+    monkeypatch.setattr(storage, "resolve_feed_token", lambda token: "abc123")
+    monkeypatch.setattr(storage, "list_shows", lambda token: [])
+
+    response = function_app.calendar_feed(_request("GET", "calendar.ics", params={"feed": "tok"}))
+
+    assert response.status_code == 200
 
 
 def test_search_returns_502_when_tvmaze_result_is_missing_required_fields(monkeypatch):

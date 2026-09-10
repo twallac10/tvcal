@@ -3,10 +3,28 @@
 Find TV shows, build a watchlist, and subscribe to one iCal feed of episode
 air dates — backed by the [TVMaze API](https://www.tvmaze.com/api). Ships as
 a single Python Azure Functions app: HTTP API plus a small static UI, backed
-by Azure Table Storage for the watchlist. No separate hosting, no
-authentication system to build.
+by Azure Table Storage for the watchlist.
 
 Open the Function App's root URL for the UI, or use the HTTP API directly.
+
+## Signing in
+
+The UI and its write API (search, watchlist add/remove, feed-token issuance)
+sit behind a single shared password — there's no per-user account system,
+just a login wall so a stumbled-upon URL is useless without it. Sign in once
+at `/`; a session cookie (HttpOnly, 30 days) keeps you logged in after that,
+with a "Log out" button to end it early.
+
+`/calendar.ics` is deliberately **not** behind this login: calendar apps
+fetch that URL directly with no cookies at all, so it's gated only by its
+own read-only feed token instead (see below) — that's the whole reason the
+write and feed tokens are separate.
+
+The password is never stored in plaintext — only its SHA-256 hash, as the
+`ACCESS_PASSWORD_HASH` app setting (see **Deploying to Azure** below for how
+to set it). To change the password, generate a new hash and update that
+setting; existing sessions stay valid until they expire since they're only
+signed with `SESSION_SECRET`, not tied to the password itself.
 
 ## How watchlists work
 
@@ -31,6 +49,11 @@ stays stable as you add or remove shows via the write token — subscribe
 once in your calendar app and it keeps updating.
 
 ## Endpoints
+
+Every endpoint below except `/calendar.ics` requires a valid session cookie
+(see **Signing in**) — `POST /auth/login` with `{"password": "..."}` sets
+one, `POST /auth/logout` clears it, `GET /auth/status` reports
+`{"authenticated": bool}` for the current cookie.
 
 ### `GET /shows/search?q=<name>`
 
@@ -107,10 +130,20 @@ azurite --silent --location .azurite &
 func start
 ```
 
-Then open `http://localhost:7071/` for the UI, or:
+Then open `http://localhost:7071/` for the UI and sign in with `changeme`
+(the password baked into `local.settings.json.example` — see **Signing in**
+above; fine for local dev, never use it in production). Signed-in API calls
+need the session cookie, so for `curl` either drive it through a cookie jar:
 
 ```bash
-curl "http://localhost:7071/shows/search?q=fringe"
+curl -c /tmp/tvcal-cookies -X POST http://localhost:7071/auth/login \
+  -H "Content-Type: application/json" -d '{"password":"changeme"}'
+curl -b /tmp/tvcal-cookies "http://localhost:7071/shows/search?q=fringe"
+```
+
+or use `/calendar.ics?show_ids=...`, which never needs a session:
+
+```bash
 curl "http://localhost:7071/calendar.ics?show_ids=82"
 ```
 
@@ -145,28 +178,40 @@ az functionapp create \
   --os-type Linux
 
 # Azure Functions serves a built-in "your app is up and running" placeholder
-# at the bare root URL by default, which overrides the UI's route="" function
+# at the bare root URL by default, which overrides the UI's route="/" function
 # even though it's registered correctly. This setting disables that.
+#
+# ACCESS_PASSWORD_HASH/SESSION_SECRET gate the app behind a login -- see
+# "Signing in" above. Generate real values, don't reuse the example ones:
+#   python3 -c "import hashlib; print(hashlib.sha256(b'<your password>').hexdigest())"
+#   python3 -c "import secrets; print(secrets.token_hex(32))"
 az functionapp config appsettings set \
   --resource-group <resource-group> \
   --name <function-app-name> \
-  --settings AzureWebJobsDisableHomepage=true
+  --settings \
+    AzureWebJobsDisableHomepage=true \
+    ACCESS_PASSWORD_HASH=<sha256 hash from above> \
+    SESSION_SECRET=<random hex from above>
 
 func azure functionapp publish <function-app-name> --python
 ```
 
 Beyond the ones Azure Functions provisions automatically
-(`AzureWebJobsStorage`, `FUNCTIONS_WORKER_RUNTIME`), the only required app
-setting is `AzureWebJobsDisableHomepage=true` above — without it, the UI at
-`/` is shadowed by Azure's default placeholder page even though every other
-route works. `AzureWebJobsStorage` is also where the watchlist table lives —
-no separate storage account needed beyond the one linked at creation.
+(`AzureWebJobsStorage`, `FUNCTIONS_WORKER_RUNTIME`), the required app
+settings are the three above: `AzureWebJobsDisableHomepage=true` (without it
+the UI at `/` is shadowed by Azure's default placeholder page even though
+every other route works), and `ACCESS_PASSWORD_HASH`/`SESSION_SECRET` (the
+login gate — without them, every session-gated route fails closed and
+nobody can sign in at all). `AzureWebJobsStorage` is also where the
+watchlist table lives — no separate storage account needed beyond the one
+linked at creation.
 
 ## Project layout
 
-- `function_app.py` — HTTP-triggered functions (UI, search, watchlist, calendar feed)
+- `function_app.py` — HTTP-triggered functions (UI, auth, search, watchlist, calendar feed)
+- `auth.py` — the shared-password login gate (session cookies, no external identity provider)
 - `tvmaze_client.py` — thin wrapper around the TVMaze REST API
 - `ical_builder.py` — builds the `.ics` calendar from TVMaze show/episode data
 - `storage.py` — watchlist persistence in Azure Table Storage
-- `static/index.html` — the search + watchlist single-page UI
+- `static/index.html` — the login + search + watchlist single-page UI
 - `tests/` — unit tests (mocked TVMaze/Table Storage, no network calls)

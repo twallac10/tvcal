@@ -121,6 +121,8 @@
   .feed-row { display: flex; gap: 8px; }
   .feed-row input { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.85rem; }
   .hint { color: var(--text-muted); font-size: 0.85rem; margin: 10px 0 0; }
+  .error { color: var(--danger); font-size: 0.85rem; margin: 10px 0 0; }
+  .topbar { display: flex; justify-content: flex-end; margin-bottom: 8px; }
 </style>
 </head>
 <body>
@@ -130,32 +132,77 @@
     <p>Search TV shows, build a watchlist, subscribe to one calendar feed.</p>
   </header>
 
-  <section id="search">
-    <h2>Find a show</h2>
-    <form id="search-form">
-      <input type="search" id="search-input" placeholder="Search by title..." autocomplete="off" required>
-      <button type="submit">Search</button>
+  <section id="login-section" hidden>
+    <h2>Sign in</h2>
+    <form id="login-form">
+      <input type="password" id="login-password" placeholder="Password" autocomplete="current-password" required>
+      <button type="submit">Sign in</button>
     </form>
-    <div id="search-results"></div>
+    <p id="login-error" class="error" hidden></p>
   </section>
 
-  <section id="watchlist">
-    <h2>My watchlist</h2>
-    <ul id="watchlist-items"></ul>
-  </section>
-
-  <section id="feed">
-    <h2>Calendar subscription</h2>
-    <div class="feed-row">
-      <input type="text" id="feed-url" readonly>
-      <button type="button" id="copy-btn" class="secondary">Copy</button>
+  <div id="app-section" hidden>
+    <div class="topbar">
+      <button type="button" id="logout-btn" class="secondary">Log out</button>
     </div>
-    <p class="hint">Paste this URL into Google Calendar, Apple Calendar, or Outlook as a subscription (not a one-time import). It always reflects your current watchlist. This link is read-only -- anyone who has it can see your episode schedule but can't change your watchlist.</p>
-  </section>
+
+    <section id="search">
+      <h2>Find a show</h2>
+      <form id="search-form">
+        <input type="search" id="search-input" placeholder="Search by title..." autocomplete="off" required>
+        <button type="submit">Search</button>
+      </form>
+      <div id="search-results"></div>
+    </section>
+
+    <section id="watchlist">
+      <h2>My watchlist</h2>
+      <ul id="watchlist-items"></ul>
+    </section>
+
+    <section id="feed">
+      <h2>Calendar subscription</h2>
+      <div class="feed-row">
+        <input type="text" id="feed-url" readonly>
+        <button type="button" id="copy-btn" class="secondary">Copy</button>
+      </div>
+      <p class="hint">Paste this URL into Google Calendar, Apple Calendar, or Outlook as a subscription (not a one-time import). It always reflects your current watchlist. This link is read-only -- anyone who has it can see your episode schedule but can't change your watchlist.</p>
+    </section>
+  </div>
 </main>
 
 <script>
   const state = { token: null, feedToken: null, watchlist: [] };
+
+  async function apiFetch(url, options) {
+    const res = await fetch(url, options);
+    if (res.status === 401) {
+      showLoginForm();
+    }
+    return res;
+  }
+
+  function showLoginForm() {
+    document.getElementById("login-section").hidden = false;
+    document.getElementById("app-section").hidden = true;
+  }
+
+  function showApp() {
+    document.getElementById("login-section").hidden = true;
+    document.getElementById("app-section").hidden = false;
+    state.token = getOrCreateToken();
+    loadWatchlist();
+  }
+
+  async function checkAuthAndInit() {
+    const res = await fetch("/auth/status");
+    const data = res.ok ? await res.json() : { authenticated: false };
+    if (data.authenticated) {
+      showApp();
+    } else {
+      showLoginForm();
+    }
+  }
 
   function getOrCreateToken() {
     const url = new URL(location.href);
@@ -174,7 +221,7 @@
   }
 
   async function loadWatchlist() {
-    const res = await fetch(`/watchlist?list=${encodeURIComponent(state.token)}`);
+    const res = await apiFetch(`/watchlist?list=${encodeURIComponent(state.token)}`);
     state.watchlist = res.ok ? await res.json() : [];
     renderWatchlist();
 
@@ -186,7 +233,7 @@
   }
 
   async function loadFeedToken() {
-    const res = await fetch(`/watchlist/feed-token?list=${encodeURIComponent(state.token)}`);
+    const res = await apiFetch(`/watchlist/feed-token?list=${encodeURIComponent(state.token)}`);
     if (res.ok) {
       state.feedToken = (await res.json()).feed_token;
     }
@@ -230,7 +277,7 @@
   }
 
   async function search(query) {
-    const res = await fetch(`/shows/search?q=${encodeURIComponent(query)}`);
+    const res = await apiFetch(`/shows/search?q=${encodeURIComponent(query)}`);
     renderResults(res.ok ? await res.json() : []);
   }
 
@@ -298,7 +345,7 @@
   }
 
   async function addShow(id, name) {
-    const res = await fetch(`/watchlist?list=${encodeURIComponent(state.token)}`, {
+    const res = await apiFetch(`/watchlist?list=${encodeURIComponent(state.token)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ show_id: id, show_name: name }),
@@ -310,7 +357,7 @@
   }
 
   async function removeShow(id) {
-    await fetch(`/watchlist/${id}?list=${encodeURIComponent(state.token)}`, { method: "DELETE" });
+    await apiFetch(`/watchlist/${id}?list=${encodeURIComponent(state.token)}`, { method: "DELETE" });
     await loadWatchlist();
   }
 
@@ -334,8 +381,33 @@
     setTimeout(() => { btn.textContent = original; }, 1500);
   });
 
-  state.token = getOrCreateToken();
-  loadWatchlist();
+  document.getElementById("login-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const passwordInput = document.getElementById("login-password");
+    const errorEl = document.getElementById("login-error");
+    errorEl.hidden = true;
+
+    const res = await fetch("/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: passwordInput.value }),
+    });
+
+    if (res.ok) {
+      passwordInput.value = "";
+      showApp();
+    } else {
+      errorEl.textContent = "Incorrect password.";
+      errorEl.hidden = false;
+    }
+  });
+
+  document.getElementById("logout-btn").addEventListener("click", async () => {
+    await fetch("/auth/logout", { method: "POST" });
+    showLoginForm();
+  });
+
+  checkAuthAndInit();
 </script>
 </body>
 </html>
