@@ -28,6 +28,12 @@ under the old pre-account scheme (a `tvcal_list_token` in localStorage from
 before you had an account), signing up automatically folds those shows into
 your new account, once — nothing is lost.
 
+**What this deliberately doesn't have**, since it's a two-person app: no
+password change, no password reset, and no per-account session revocation.
+If a password needs changing you edit (or delete) that account's row in
+Table Storage by hand; the only session kill switch is rotating
+`SESSION_SECRET`, which signs everyone out at once.
+
 `/calendar.ics` is deliberately **not** behind this login: calendar apps
 fetch that URL directly with no cookies at all, so it's gated only by its
 own read-only feed token instead (see below) — that's the whole reason the
@@ -65,7 +71,9 @@ valid session cookie (see **Signing in**).
   still succeeds) if it matches another real account's username, so it
   can't be used to pull someone else's watchlist into your new account.
   `409` if the username's taken, `401` for a wrong `signup_code`, `403`
-  once `MAX_ACCOUNTS` is reached.
+  once `MAX_ACCOUNTS` is reached or if no `SIGNUP_CODE` is configured at
+  all (signups closed). Passwords are capped at 1024 characters — these
+  endpoints are anonymous and always run PBKDF2.
 - `POST /auth/login` — body `{"username", "password"}`. Sets the session cookie.
 - `POST /auth/logout` — clears the session cookie.
 - `GET /auth/status` — `{"authenticated": bool, "username": str | null}` for
@@ -126,8 +134,14 @@ GET /calendar.ics?feed=RmVlZFRva2VuRXhhbXBsZQ
 
 Each event's summary is `<Show> - S01E01 - <Episode Title>`, timed at the
 episode's air date/time with a duration from the episode (or show) runtime.
-If TVMaze can't return data for one show (deleted, renamed ID, transient
-error), that show is skipped and logged rather than failing the whole feed.
+
+A show that TVMaze no longer knows about (deleted or renumbered ID) is
+skipped and logged — one dead ID shouldn't take down the rest of the feed.
+A *transient* failure (TVMaze down, rate-limiting, a network error) is
+different: the whole request returns `502` rather than a `200` missing
+those shows, because calendar apps treat a success as authoritative and
+delete every event absent from it — so serving a partial feed would
+silently wipe or flap the subscriber's episodes.
 
 ## Running locally
 
@@ -229,8 +243,9 @@ watchlist and account tables live — no separate storage account needed
 beyond the one linked at creation.
 
 After the first account or two are created, consider rotating `SIGNUP_CODE`
-to something only you know (or blanking it, which makes signup fail closed)
-so the invite code can't be reused by someone who found it once:
+to something only you know — or blanking it entirely, which closes signups
+(`/auth/signup` then returns `403 Signups are closed.`) — so the invite
+code can't be reused by someone who came across it once:
 
 ```bash
 az functionapp config appsettings set \

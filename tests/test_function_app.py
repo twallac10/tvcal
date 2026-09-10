@@ -92,7 +92,9 @@ def test_auth_signup_rejects_missing_fields():
     assert response.status_code == 400
 
 
-def test_auth_signup_returns_500_when_signup_code_unconfigured(monkeypatch):
+def test_auth_signup_reports_signups_closed_when_no_signup_code_configured(monkeypatch):
+    # No SIGNUP_CODE is the documented way to stop accepting new accounts,
+    # so it's a deliberate 403, not a 500 with an ERROR log per attempt.
     def raise_unconfigured(code):
         raise auth.AuthConfigError("nope")
 
@@ -103,7 +105,7 @@ def test_auth_signup_returns_500_when_signup_code_unconfigured(monkeypatch):
     ).encode()
     response = function_app.auth_signup(_request("POST", "auth/signup", body=body))
 
-    assert response.status_code == 500
+    assert response.status_code == 403
 
 
 def test_auth_signup_rejects_invalid_username(monkeypatch):
@@ -219,7 +221,46 @@ def test_auth_status_reports_unauthenticated(monkeypatch):
     assert json.loads(response.get_body()) == {"authenticated": False, "username": None}
 
 
-def test_protected_routes_require_a_session(monkeypatch):
+# Routes deliberately reachable without a session, each with the reason it
+# has to be. Anything else registered on the app must carry
+# @auth.require_session.
+PUBLIC_ROUTES = {
+    "index": "renders the login form itself, before anyone can have a session",
+    "auth_signup": "creating an account is how you get a session",
+    "auth_login": "logging in is how you get a session",
+    "auth_logout": "clearing a cookie shouldn't require a valid one",
+    "auth_status": "reports whether you have a session",
+    "calendar_feed": "calendar apps fetch it with no cookies; gated by its feed token",
+}
+
+
+def _registered_functions():
+    # get_functions() populates an internal bindings dict and validates
+    # against it, so a second call on the same app raises on "duplicate"
+    # names. Reset it so this is safe to call from more than one test.
+    function_app.app.functions_bindings = {}
+    return function_app.app.get_functions()
+
+
+def test_every_registered_route_is_gated_or_explicitly_public():
+    # Enumerated rather than hand-listed: a list of protected routes stays
+    # green when a NEW route forgets @auth.require_session, which is
+    # exactly when you'd want a failure.
+    for function in _registered_functions():
+        name = function.get_function_name()
+        gated = getattr(function.get_user_function(), "requires_session", False)
+        assert gated or name in PUBLIC_ROUTES, (
+            f"Route '{name}' is neither gated by @auth.require_session nor listed in "
+            f"PUBLIC_ROUTES. Add the decorator, or add it to PUBLIC_ROUTES with the reason."
+        )
+
+
+def test_public_route_allowlist_has_no_stale_entries():
+    registered = {f.get_function_name() for f in _registered_functions()}
+    assert set(PUBLIC_ROUTES) <= registered
+
+
+def test_protected_routes_return_401_without_a_session(monkeypatch):
     monkeypatch.setattr(auth, "is_authenticated", lambda req: False)
 
     protected = [
@@ -478,6 +519,82 @@ def test_calendar_feed_concurrent_fetch_isolates_multiple_failures(monkeypatch):
     assert response.status_code == 200
     for show_id in good_ids:
         assert f"tvmaze-episode-{show_id}@tvcal".encode() in body
+
+
+def test_calendar_feed_refuses_to_serve_a_partial_feed_on_transient_failure(monkeypatch):
+    # Calendar clients treat a 200 as authoritative and delete events
+    # missing from it, so silently dropping a show that failed for a
+    # transient reason would wipe (or flap) the subscriber's episodes.
+    feed_token = _use_feed_token(monkeypatch)
+    monkeypatch.setattr(
+        storage,
+        "list_shows",
+        lambda token: [{"id": 82, "name": "Fringe"}, {"id": 143, "name": "Breaking Bad"}],
+    )
+
+    def fake_get_show_with_episodes(show_id):
+        if show_id == 143:
+            raise ConnectionError("TVMaze unreachable")
+        return {"id": 82, "name": "Fringe", "runtime": 60}, [_PILOT_EPISODE]
+
+    monkeypatch.setattr(function_app, "get_show_with_episodes", fake_get_show_with_episodes)
+
+    response = function_app.calendar_feed(_request("GET", "calendar.ics", params={"feed": feed_token}))
+
+    assert response.status_code == 502
+
+
+def test_calendar_feed_still_skips_permanently_missing_shows(monkeypatch):
+    # A show genuinely gone from TVMaze (404 -> TVMazeError) is different
+    # from a transient failure: skip it and serve the rest.
+    feed_token = _use_feed_token(monkeypatch)
+    monkeypatch.setattr(
+        storage,
+        "list_shows",
+        lambda token: [{"id": 999, "name": "Gone"}, {"id": 82, "name": "Fringe"}],
+    )
+
+    def fake_get_show_with_episodes(show_id):
+        if show_id == 999:
+            raise TVMazeError("gone")
+        return {"id": 82, "name": "Fringe", "runtime": 60}, [_PILOT_EPISODE]
+
+    monkeypatch.setattr(function_app, "get_show_with_episodes", fake_get_show_with_episodes)
+
+    response = function_app.calendar_feed(_request("GET", "calendar.ics", params={"feed": feed_token}))
+
+    assert response.status_code == 200
+    assert b"Fringe - S01E01 - Pilot" in response.get_body()
+
+
+def test_watchlist_remove_rejects_out_of_range_show_id():
+    response = function_app.watchlist_remove(
+        _request("DELETE", "watchlist/x", route_params={"show_id": str(10**16)})
+    )
+    assert response.status_code == 400
+
+
+def test_auth_login_rejects_an_oversized_password_without_hashing(monkeypatch):
+    def fail_if_called(username, password):
+        raise AssertionError("should reject before hashing")
+
+    monkeypatch.setattr(auth, "verify_login", fail_if_called)
+
+    body = json.dumps({"username": "alice", "password": "a" * 100_000}).encode()
+    response = function_app.auth_login(_request("POST", "auth/login", body=body))
+
+    assert response.status_code == 401
+
+
+def test_auth_signup_rejects_an_oversized_password(monkeypatch):
+    monkeypatch.setattr(auth, "check_signup_code", lambda code: True)
+
+    body = json.dumps(
+        {"username": "alice", "password": "a" * 100_000, "signup_code": "letmein"}
+    ).encode()
+    response = function_app.auth_signup(_request("POST", "auth/signup", body=body))
+
+    assert response.status_code == 400
 
 
 def test_calendar_feed_caps_show_ids_param():
