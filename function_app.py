@@ -16,9 +16,12 @@ app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 STATIC_DIR = pathlib.Path(__file__).parent / "static"
 MAX_SHOW_NAME_LENGTH = 200
 MAX_SHOW_ID = 10**15
-MAX_SHOW_IDS_PARAM = 50
 MAX_CONCURRENT_TVMAZE_FETCHES = 10
 MIN_PASSWORD_LENGTH = 8
+# /auth/login and /auth/signup are anonymous and always run PBKDF2, so an
+# unbounded password would let anyone make the worker hash an arbitrarily
+# large string (a 50MB body OOMs a Consumption instance).
+MAX_PASSWORD_LENGTH = 1024
 
 
 @app.route(route="/", methods=["GET"])
@@ -64,16 +67,20 @@ def auth_signup(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(
             "Body must include 'username', 'password', and 'signup_code'.", status_code=400
         )
-    if len(password) < MIN_PASSWORD_LENGTH:
+    if not (MIN_PASSWORD_LENGTH <= len(password) <= MAX_PASSWORD_LENGTH):
         return func.HttpResponse(
-            f"Password must be at least {MIN_PASSWORD_LENGTH} characters.", status_code=400
+            f"Password must be between {MIN_PASSWORD_LENGTH} and "
+            f"{MAX_PASSWORD_LENGTH} characters.",
+            status_code=400,
         )
 
     try:
         code_ok = auth.check_signup_code(signup_code)
     except auth.AuthConfigError:
-        logging.error("Signup attempted but SIGNUP_CODE app setting is not configured.")
-        return func.HttpResponse("Server auth is not configured.", status_code=500)
+        # No SIGNUP_CODE configured means signups are deliberately closed
+        # (the documented way to stop accepting new accounts), not a broken
+        # server -- say so plainly instead of 500ing on every attempt.
+        return func.HttpResponse("Signups are closed.", status_code=403)
     if not code_ok:
         return func.HttpResponse("Invalid signup code.", status_code=401)
 
@@ -113,6 +120,9 @@ def auth_login(req: func.HttpRequest) -> func.HttpResponse:
     password = body.get("password")
     if not isinstance(username, str) or not username or not isinstance(password, str) or not password:
         return func.HttpResponse("Body must include 'username' and 'password'.", status_code=400)
+    if len(password) > MAX_PASSWORD_LENGTH:
+        # Reject before hashing -- see MAX_PASSWORD_LENGTH above.
+        return func.HttpResponse("Incorrect username or password.", status_code=401)
 
     try:
         valid = auth.verify_login(username, password)
@@ -238,63 +248,50 @@ def watchlist_remove(req: func.HttpRequest) -> func.HttpResponse:
     except (KeyError, ValueError):
         return func.HttpResponse("show_id must be an integer.", status_code=400)
 
+    # Same bounds as watchlist_add: an oversized value would otherwise reach
+    # Table Storage as a RowKey past its 1024-char limit and 500.
+    if not (0 < show_id < MAX_SHOW_ID):
+        return func.HttpResponse("show_id is out of range.", status_code=400)
+
     storage.remove_show(auth.get_username(req), show_id)
     return func.HttpResponse(status_code=204)
 
 
 @app.route(route="calendar.ics", methods=["GET"])
 def calendar_feed(req: func.HttpRequest) -> func.HttpResponse:
-    """GET /calendar.ics?feed=<feed_token> or ?show_ids=<id,id,...> -> iCal feed.
+    """GET /calendar.ics?feed=<feed_token> -> iCal feed for that watchlist.
 
     The URL is meant to be pasted straight into a calendar app (Google
     Calendar, Apple Calendar, Outlook, ...) as a subscription so new episodes
-    show up automatically as TVMaze publishes air dates. When built from a
-    feed token (see GET /watchlist/feed-token), the same URL keeps working
-    as shows are added/removed -- no need to re-subscribe. The feed token is
-    read-only by design -- it is not the watchlist's write token, so it
+    show up automatically as TVMaze publishes air dates. The same URL keeps
+    working as shows are added/removed -- no need to re-subscribe. The feed
+    token is read-only by design -- it is not the account's login, so it
     can't be used to add or remove shows even if the URL leaks.
 
     Deliberately not @auth.require_session: calendar apps fetch this URL
     directly with no cookies at all, so a session gate would just break
-    subscriptions. The feed token is this endpoint's only gate.
+    subscriptions. The feed token is this endpoint's only gate, and it's
+    the only way in -- an unauthenticated caller with no token can't make
+    this endpoint reach TVMaze at all.
     """
     feed_token = req.params.get("feed")
-    raw_ids = req.params.get("show_ids")
-
-    if feed_token:
-        try:
-            write_token = storage.resolve_feed_token(feed_token)
-            show_ids = [show["id"] for show in storage.list_shows(write_token)]
-        except storage.InvalidListToken as exc:
-            return func.HttpResponse(str(exc), status_code=400)
-        except storage.UnknownFeedToken as exc:
-            return func.HttpResponse(str(exc), status_code=404)
-    elif raw_ids:
-        try:
-            show_ids = list(
-                dict.fromkeys(int(value.strip()) for value in raw_ids.split(",") if value.strip())
-            )
-        except ValueError:
-            return func.HttpResponse(
-                "show_ids must be a comma-separated list of TVMaze show IDs.", status_code=400
-            )
-        if not show_ids:
-            return func.HttpResponse("No valid show IDs supplied.", status_code=400)
-        if len(show_ids) > MAX_SHOW_IDS_PARAM:
-            return func.HttpResponse(
-                f"show_ids supports at most {MAX_SHOW_IDS_PARAM} shows per request.",
-                status_code=400,
-            )
-    else:
+    if not feed_token:
         return func.HttpResponse(
-            "Query parameter 'feed' (calendar feed token) or 'show_ids' is required.",
-            status_code=400,
+            "Query parameter 'feed' (calendar feed token) is required.", status_code=400
         )
 
-    # Best-effort and concurrent: a single missing/broken show shouldn't blank
-    # out the whole subscription for every other show, and fetching shows one
-    # at a time would risk the platform's request timeout on a large watchlist.
+    try:
+        write_token = storage.resolve_feed_token(feed_token)
+        show_ids = [show["id"] for show in storage.list_shows(write_token)]
+    except storage.InvalidListToken as exc:
+        return func.HttpResponse(str(exc), status_code=400)
+    except storage.UnknownFeedToken as exc:
+        return func.HttpResponse(str(exc), status_code=404)
+
+    # Concurrent: fetching a large watchlist one show at a time would risk
+    # the platform's request timeout.
     shows_with_episodes = []
+    transient_failures = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TVMAZE_FETCHES) as pool:
         future_to_show_id = {pool.submit(get_show_with_episodes, show_id): show_id for show_id in show_ids}
         for future in concurrent.futures.as_completed(future_to_show_id):
@@ -302,9 +299,29 @@ def calendar_feed(req: func.HttpRequest) -> func.HttpResponse:
             try:
                 shows_with_episodes.append(future.result())
             except TVMazeError:
+                # The show is genuinely gone from TVMaze. Skipping it is
+                # correct and permanent, not a blip -- one dead ID must not
+                # take down the rest of the feed.
                 logging.warning("Skipping unknown TVMaze show_id=%s", show_id)
             except Exception:
                 logging.exception("TVMaze lookup failed for show_id=%s", show_id)
+                transient_failures += 1
+
+    if transient_failures:
+        # Never serve a partial feed as 200. Calendar apps treat a success
+        # as authoritative and delete every event missing from it, so a
+        # TVMaze outage or rate-limit would silently wipe the subscriber's
+        # episodes -- or flap them in and out as different shows fail on
+        # each poll. An error response makes clients keep what they have.
+        logging.error(
+            "Refusing to serve a partial calendar: %d of %d TVMaze lookups failed.",
+            transient_failures,
+            len(show_ids),
+        )
+        return func.HttpResponse(
+            "Couldn't reach TVMaze for some shows; refusing to serve an incomplete calendar.",
+            status_code=502,
+        )
 
     calendar = build_calendar(shows_with_episodes)
     return func.HttpResponse(

@@ -141,6 +141,16 @@ def list_shows(list_token: str) -> list[dict]:
     )
 
 
+def _ensure_feed_index(client, feed_token: str, list_token: str) -> None:
+    """Point `feed_token` at `list_token` in the lookup index, idempotently."""
+    try:
+        client.create_entity(
+            {"PartitionKey": _FEED_INDEX_PARTITION, "RowKey": feed_token, "WriteToken": list_token}
+        )
+    except ResourceExistsError:
+        pass
+
+
 def get_or_create_feed_token(list_token: str) -> str:
     """Return the read-only calendar-feed token for a watchlist, creating one if needed."""
     validate_token(list_token)
@@ -148,11 +158,22 @@ def get_or_create_feed_token(list_token: str) -> str:
 
     try:
         meta = client.get_entity(partition_key=list_token, row_key=_META_ROW_KEY)
-        return meta["FeedToken"]
     except ResourceNotFoundError:
         pass
+    else:
+        feed_token = meta["FeedToken"]
+        # Self-heal: an older build wrote the meta row before the index row,
+        # so a crash or a transient Table Storage error between the two left
+        # a token that resolve_feed_token() can never resolve -- a calendar
+        # URL that 404s forever, with retries returning the same dead token.
+        _ensure_feed_index(client, feed_token, list_token)
+        return feed_token
 
     feed_token = secrets.token_urlsafe(24)
+    # Index row first, deliberately: an orphaned index row is harmless (its
+    # token is never handed out), whereas an orphaned meta row bricks this
+    # watchlist's calendar URL permanently.
+    _ensure_feed_index(client, feed_token, list_token)
     try:
         client.create_entity(
             {"PartitionKey": list_token, "RowKey": _META_ROW_KEY, "FeedToken": feed_token}
@@ -163,9 +184,6 @@ def get_or_create_feed_token(list_token: str) -> str:
         meta = client.get_entity(partition_key=list_token, row_key=_META_ROW_KEY)
         return meta["FeedToken"]
 
-    client.create_entity(
-        {"PartitionKey": _FEED_INDEX_PARTITION, "RowKey": feed_token, "WriteToken": list_token}
-    )
     return feed_token
 
 

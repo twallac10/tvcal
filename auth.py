@@ -192,4 +192,8 @@ def require_session(handler):
             return func.HttpResponse("Not authenticated.", status_code=401)
         return handler(req)
 
+    # Lets the test suite enumerate registered routes and prove every
+    # non-public one is gated, instead of relying on a hand-kept list that
+    # silently stays green when a new route forgets this decorator.
+    wrapper.requires_session = True
     return wrapper

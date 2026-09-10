@@ -1,57 +1,10 @@
-import re
-
 import pytest
-from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
+from azure.core.exceptions import ServiceRequestError
 
 import storage
 
-
-class FakeTableClient:
-    """In-memory stand-in for azure.data.tables.TableClient."""
-
-    def __init__(self):
-        self.rows: dict[tuple[str, str], dict] = {}
-
-    def upsert_entity(self, entity):
-        self.rows[(entity["PartitionKey"], entity["RowKey"])] = entity
-
-    def create_entity(self, entity):
-        key = (entity["PartitionKey"], entity["RowKey"])
-        if key in self.rows:
-            raise ResourceExistsError("already exists")
-        self.rows[key] = entity
-
-    def get_entity(self, partition_key, row_key):
-        key = (partition_key, row_key)
-        if key not in self.rows:
-            raise ResourceNotFoundError("not found")
-        return self.rows[key]
-
-    def delete_entity(self, partition_key, row_key):
-        key = (partition_key, row_key)
-        if key not in self.rows:
-            raise ResourceNotFoundError("not found")
-        del self.rows[key]
-
-    def query_entities(self, query_filter, select=None):
-        quoted = re.findall(r"'([^']*)'", query_filter)
-        partition_key = quoted[0]
-        excluded_row_key = quoted[1] if "RowKey ne" in query_filter else None
-        entities = [
-            entity
-            for (partition_key_, row_key_), entity in self.rows.items()
-            if partition_key_ == partition_key and row_key_ != excluded_row_key
-        ]
-        if select is None:
-            return entities
-        return [{key: entity[key] for key in select} for entity in entities]
-
-
-@pytest.fixture
-def fake_client(monkeypatch):
-    client = FakeTableClient()
-    monkeypatch.setattr(storage, "_table_client", lambda: client)
-    return client
+# FakeTableClient / the `fake_client` fixture live in conftest.py so the
+# end-to-end tests can drive the same fake through the real routes.
 
 
 def test_add_and_list_shows(fake_client):
@@ -282,6 +235,62 @@ def test_migrate_watchlist_refuses_to_copy_from_a_real_account(fake_client):
 
     assert storage.list_shows("attacker") == []
     assert storage.list_shows("bob") == [{"id": 1, "name": "Bob's Private Show"}]
+
+
+def test_feed_token_survives_a_failure_between_its_two_writes(fake_client):
+    # The meta row and the index row are two separate, non-atomic writes.
+    # If the second one fails (transient Table Storage error, instance
+    # killed mid-request), the next call must not keep handing back a token
+    # that resolve_feed_token() can't resolve -- that's a calendar URL that
+    # 404s forever with no way to recover short of editing storage by hand.
+    real_create_entity = fake_client.create_entity
+    failed_once = []
+
+    def create_entity_failing_on_index(entity):
+        if entity["PartitionKey"] == storage._FEED_INDEX_PARTITION and not failed_once:
+            failed_once.append(True)
+            raise ServiceRequestError("transient")
+        return real_create_entity(entity)
+
+    fake_client.create_entity = create_entity_failing_on_index
+
+    with pytest.raises(ServiceRequestError):
+        storage.get_or_create_feed_token("alice")
+
+    feed_token = storage.get_or_create_feed_token("alice")
+    assert storage.resolve_feed_token(feed_token) == "alice"
+
+
+def test_feed_token_self_heals_a_missing_index_row(fake_client):
+    # Simulates a watchlist left orphaned by an older build that wrote the
+    # meta row first: the meta row exists, the index row doesn't.
+    feed_token = storage.get_or_create_feed_token("alice")
+    del fake_client.rows[(storage._FEED_INDEX_PARTITION, feed_token)]
+    with pytest.raises(storage.UnknownFeedToken):
+        storage.resolve_feed_token(feed_token)
+
+    reissued = storage.get_or_create_feed_token("alice")
+
+    assert reissued == feed_token
+    assert storage.resolve_feed_token(feed_token) == "alice"
+
+
+@pytest.mark.parametrize(
+    "injection",
+    ["x' or PartitionKey ne 'zzz", "a' or '1' eq '1", "abc'--"],
+)
+def test_odata_filter_injection_shaped_tokens_are_rejected(fake_client, injection):
+    # storage builds OData filters by interpolation, so validate_token
+    # rejecting quotes is the thing standing between a malformed token and
+    # a cross-partition read. The in-memory fake can't detect a broken
+    # filter, so assert the input never gets that far.
+    for call in (
+        lambda: storage.list_shows(injection),
+        lambda: storage.add_show(injection, 1, "Show"),
+        lambda: storage.get_account(injection),
+    ):
+        with pytest.raises(storage.InvalidListToken):
+            call()
 
 
 @pytest.mark.parametrize("reserved", ["__accounts__", "__feed_index__", "__meta__"])

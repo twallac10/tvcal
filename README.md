@@ -28,6 +28,12 @@ under the old pre-account scheme (a `tvcal_list_token` in localStorage from
 before you had an account), signing up automatically folds those shows into
 your new account, once — nothing is lost.
 
+**What this deliberately doesn't have**, since it's a two-person app: no
+password change, no password reset, and no per-account session revocation.
+If a password needs changing you edit (or delete) that account's row in
+Table Storage by hand; the only session kill switch is rotating
+`SESSION_SECRET`, which signs everyone out at once.
+
 `/calendar.ics` is deliberately **not** behind this login: calendar apps
 fetch that URL directly with no cookies at all, so it's gated only by its
 own read-only feed token instead (see below) — that's the whole reason the
@@ -65,7 +71,9 @@ valid session cookie (see **Signing in**).
   still succeeds) if it matches another real account's username, so it
   can't be used to pull someone else's watchlist into your new account.
   `409` if the username's taken, `401` for a wrong `signup_code`, `403`
-  once `MAX_ACCOUNTS` is reached.
+  once `MAX_ACCOUNTS` is reached or if no `SIGNUP_CODE` is configured at
+  all (signups closed). Passwords are capped at 1024 characters — these
+  endpoints are anonymous and always run PBKDF2.
 - `POST /auth/login` — body `{"username", "password"}`. Sets the session cookie.
 - `POST /auth/logout` — clears the session cookie.
 - `GET /auth/status` — `{"authenticated": bool, "username": str | null}` for
@@ -112,13 +120,15 @@ Returns (creating on first call) the read-only feed token for your
 watchlist: `{"feed_token": "..."}`. Idempotent — repeat calls return the
 same token.
 
-### `GET /calendar.ics?feed=<feed_token>` or `?show_ids=<id,id,...>`
+### `GET /calendar.ics?feed=<feed_token>`
 
-Returns an `.ics` feed with one event per aired/upcoming episode. Use
-`feed=<feed_token>` (from `GET /watchlist/feed-token`) for a stable,
-auto-updating feed tied to a watchlist, or `show_ids=82,143` (max 50 IDs)
-for a one-off feed built from specific TVMaze show IDs without going
-through a watchlist at all.
+Returns an `.ics` feed with one event per aired/upcoming episode on the
+watchlist that `feed_token` (from `GET /watchlist/feed-token`) belongs to.
+Stable and auto-updating: subscribe once and it follows the watchlist.
+
+A valid feed token is the only way in. This endpoint takes no session
+cookie (calendar apps can't send one), so the token is what stops an
+anonymous caller from making it fan out requests to TVMaze.
 
 ```
 GET /calendar.ics?feed=RmVlZFRva2VuRXhhbXBsZQ
@@ -126,8 +136,14 @@ GET /calendar.ics?feed=RmVlZFRva2VuRXhhbXBsZQ
 
 Each event's summary is `<Show> - S01E01 - <Episode Title>`, timed at the
 episode's air date/time with a duration from the episode (or show) runtime.
-If TVMaze can't return data for one show (deleted, renamed ID, transient
-error), that show is skipped and logged rather than failing the whole feed.
+
+A show that TVMaze no longer knows about (deleted or renumbered ID) is
+skipped and logged — one dead ID shouldn't take down the rest of the feed.
+A *transient* failure (TVMaze down, rate-limiting, a network error) is
+different: the whole request returns `502` rather than a `200` missing
+those shows, because calendar apps treat a success as authoritative and
+delete every event absent from it — so serving a partial feed would
+silently wipe or flap the subscriber's episodes.
 
 ## Running locally
 
@@ -150,21 +166,20 @@ func start
 Then open `http://localhost:7071/` for the UI, click "Need an account? Sign
 up", and use invite code `changeme` (the value baked into
 `local.settings.json.example` — see **Signing in** above; fine for local
-dev, never use it in production) to create yourself an account. Signed-in
-API calls need the session cookie, so for `curl` either sign up/in through a
-cookie jar:
+dev, never use it in production) to create yourself an account. Every API
+call except `/calendar.ics` needs the session cookie, so drive `curl`
+through a cookie jar:
 
 ```bash
 curl -c /tmp/tvcal-cookies -X POST http://localhost:7071/auth/signup \
   -H "Content-Type: application/json" \
   -d '{"username":"me","password":"a-real-password","signup_code":"changeme"}'
+
 curl -b /tmp/tvcal-cookies "http://localhost:7071/shows/search?q=fringe"
-```
 
-or use `/calendar.ics?show_ids=...`, which never needs a session:
-
-```bash
-curl "http://localhost:7071/calendar.ics?show_ids=82"
+# the calendar feed takes no cookie -- grab its token, then fetch it
+curl -b /tmp/tvcal-cookies "http://localhost:7071/watchlist/feed-token"
+curl "http://localhost:7071/calendar.ics?feed=<feed_token from above>"
 ```
 
 ## Tests
@@ -229,8 +244,9 @@ watchlist and account tables live — no separate storage account needed
 beyond the one linked at creation.
 
 After the first account or two are created, consider rotating `SIGNUP_CODE`
-to something only you know (or blanking it, which makes signup fail closed)
-so the invite code can't be reused by someone who found it once:
+to something only you know — or blanking it entirely, which closes signups
+(`/auth/signup` then returns `403 Signups are closed.`) — so the invite
+code can't be reused by someone who came across it once:
 
 ```bash
 az functionapp config appsettings set \

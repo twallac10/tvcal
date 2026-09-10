@@ -12,6 +12,11 @@ DEFAULT_RUNTIME_MINUTES = 30
 _HTML_TAG_RE = re.compile(r"<[^<]+?>")
 
 
+def _safe_id(value) -> object:
+    """Best-effort id for a log line, for values that may not be dicts at all."""
+    return value.get("id") if isinstance(value, dict) else None
+
+
 def build_calendar(shows_with_episodes: list[tuple[dict, list[dict]]]) -> Calendar:
     calendar = Calendar()
     calendar.add("prodid", "-//tvcal//TV Show Episode Tracker//EN")
@@ -20,17 +25,24 @@ def build_calendar(shows_with_episodes: list[tuple[dict, list[dict]]]) -> Calend
     calendar.add("method", "PUBLISH")
 
     for show, episodes in shows_with_episodes:
+        if not isinstance(episodes, list):
+            logging.warning("Skipping show %r with a malformed episode list", _safe_id(show))
+            continue
+
         for episode in episodes:
             try:
                 event = build_event(show, episode)
-            except (TypeError, ValueError):
+            except Exception:
                 # TVMaze data is untrusted input -- an episode with a
-                # malformed field (e.g. a non-numeric runtime/season/number)
-                # shouldn't take down every other show's events with it.
+                # malformed field shouldn't take down every other show's
+                # events with it. Deliberately broad: a non-numeric runtime
+                # raises TypeError, an out-of-range one OverflowError, and a
+                # non-dict episode AttributeError, all of which would
+                # otherwise 500 the entire feed.
                 logging.warning(
                     "Skipping malformed episode %r for show %r",
-                    episode.get("id"),
-                    show.get("id"),
+                    _safe_id(episode),
+                    _safe_id(show),
                 )
                 continue
             if event is not None:

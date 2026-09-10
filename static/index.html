@@ -218,6 +218,14 @@
   }
 
   function showLoginForm() {
+    // Clear the previous session's data. This runs on 401 as well as
+    // logout, so without it an expired session followed by someone else
+    // signing in on the same tab would show them the previous user's
+    // still-cached feed URL and watchlist.
+    state.username = null;
+    state.feedToken = null;
+    state.watchlist = [];
+
     document.getElementById("login-section").hidden = false;
     document.getElementById("app-section").hidden = true;
     setAuthMode("login");
@@ -477,9 +485,6 @@
 
   document.getElementById("logout-btn").addEventListener("click", async () => {
     await fetch("/auth/logout", { method: "POST" });
-    state.username = null;
-    state.feedToken = null;
-    state.watchlist = [];
     showLoginForm();
   });
 
