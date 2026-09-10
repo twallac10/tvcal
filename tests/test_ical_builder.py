@@ -52,3 +52,27 @@ def test_build_calendar_serializes_to_valid_ical_bytes():
 
     assert b"BEGIN:VCALENDAR" in raw
     assert Calendar.from_ical(raw) is not None
+
+
+def test_build_calendar_respects_a_real_zero_minute_episode_runtime():
+    episode = {**AIRED_EPISODE, "runtime": 0}
+    calendar = build_calendar([(SHOW, [episode])])
+    event = calendar.walk("VEVENT")[0]
+
+    start = event["dtstart"].dt
+    end = event["dtend"].dt
+    assert (end - start).total_seconds() == 0
+
+
+def test_build_calendar_skips_episode_with_unparseable_airstamp():
+    episode = {**AIRED_EPISODE, "airstamp": "not-a-timestamp"}
+    calendar = build_calendar([(SHOW, [episode])])
+
+    assert calendar.walk("VEVENT") == []
+
+
+def test_build_calendar_skips_episode_missing_id():
+    episode = {k: v for k, v in AIRED_EPISODE.items() if k != "id"}
+    calendar = build_calendar([(SHOW, [episode])])
+
+    assert calendar.walk("VEVENT") == []

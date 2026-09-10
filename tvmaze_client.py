@@ -43,3 +43,18 @@ def get_show_episodes(show_id: int) -> list[dict]:
         raise TVMazeError(f"No TVMaze show with id {show_id}")
     response.raise_for_status()
     return response.json()
+
+
+def get_show_with_episodes(show_id: int) -> tuple[dict, list[dict]]:
+    """Fetch a show and its full episode list in a single TVMaze request."""
+    response = requests.get(
+        f"{TVMAZE_BASE_URL}/shows/{show_id}",
+        params={"embed": "episodes"},
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    if response.status_code == 404:
+        raise TVMazeError(f"No TVMaze show with id {show_id}")
+    response.raise_for_status()
+    show = response.json()
+    episodes = show.pop("_embedded", {}).get("episodes", [])
+    return show, episodes

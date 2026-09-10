@@ -19,13 +19,16 @@ class FakeTableClient:
             raise ResourceNotFoundError("not found")
         del self.rows[key]
 
-    def query_entities(self, query_filter):
+    def query_entities(self, query_filter, select=None):
         token = query_filter.split("'")[1]
-        return [
+        entities = [
             entity
             for (partition_key, _row_key), entity in self.rows.items()
             if partition_key == token
         ]
+        if select is None:
+            return entities
+        return [{key: entity[key] for key in select} for entity in entities]
 
 
 @pytest.fixture
@@ -74,3 +77,27 @@ def test_remove_missing_show_is_a_noop(fake_client):
 def test_invalid_token_rejected(fake_client, bad_token):
     with pytest.raises(storage.InvalidListToken):
         storage.add_show(bad_token, 1, "Show")
+
+
+def test_add_show_rejects_once_watchlist_is_full(fake_client, monkeypatch):
+    monkeypatch.setattr(storage, "MAX_WATCHLIST_SIZE", 2)
+
+    storage.add_show("abc123", 1, "Show 1")
+    storage.add_show("abc123", 2, "Show 2")
+
+    with pytest.raises(storage.WatchlistFull):
+        storage.add_show("abc123", 3, "Show 3")
+
+
+def test_add_show_re_adding_existing_show_does_not_count_against_cap(fake_client, monkeypatch):
+    monkeypatch.setattr(storage, "MAX_WATCHLIST_SIZE", 2)
+
+    storage.add_show("abc123", 1, "Show 1")
+    storage.add_show("abc123", 2, "Show 2")
+
+    storage.add_show("abc123", 1, "Show 1 renamed")
+
+    assert storage.list_shows("abc123") == [
+        {"id": 1, "name": "Show 1 renamed"},
+        {"id": 2, "name": "Show 2"},
+    ]

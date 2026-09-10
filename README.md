@@ -52,7 +52,7 @@ Returns the shows currently on that watchlist: `[{"id": 82, "name": "Fringe"}, .
 ### `POST /watchlist?list=<token>`
 
 Body: `{"show_id": 82, "show_name": "Fringe"}`. Adds (or re-adds) a show.
-`204 No Content` on success.
+`204 No Content` on success. `409 Conflict` once a watchlist hits 100 shows.
 
 ### `DELETE /watchlist/{show_id}?list=<token>`
 
@@ -62,8 +62,8 @@ Removes a show from the watchlist. `204 No Content` on success (idempotent).
 
 Returns an `.ics` feed with one event per aired/upcoming episode. Use
 `list=<token>` for a stable, auto-updating feed tied to a watchlist, or
-`show_ids=82,143` for a one-off feed built from specific TVMaze show IDs
-without going through the watchlist at all.
+`show_ids=82,143` (max 50 IDs) for a one-off feed built from specific TVMaze
+show IDs without going through the watchlist at all.
 
 ```
 GET /calendar.ics?list=9f2c6e2a-3b34-4b1a-9a2b-3a0d9d7b6b2a
@@ -71,6 +71,8 @@ GET /calendar.ics?list=9f2c6e2a-3b34-4b1a-9a2b-3a0d9d7b6b2a
 
 Each event's summary is `<Show> - S01E01 - <Episode Title>`, timed at the
 episode's air date/time with a duration from the episode (or show) runtime.
+If TVMaze can't return data for one show (deleted, renamed ID, transient
+error), that show is skipped and logged rather than failing the whole feed.
 
 ## Running locally
 

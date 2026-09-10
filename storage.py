@@ -14,11 +14,18 @@ from azure.core.exceptions import ResourceNotFoundError
 from azure.data.tables import TableServiceClient
 
 TABLE_NAME = "watchlistshows"
+MAX_WATCHLIST_SIZE = 100
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
+
+_table_client_singleton = None
 
 
 class InvalidListToken(Exception):
     """Raised when a list token fails basic format validation."""
+
+
+class WatchlistFull(Exception):
+    """Raised when a watchlist already has MAX_WATCHLIST_SIZE shows."""
 
 
 def validate_token(list_token: str) -> None:
@@ -29,17 +36,29 @@ def validate_token(list_token: str) -> None:
 
 
 def _table_client():
-    connection_string = os.environ["AzureWebJobsStorage"]
-    service = TableServiceClient.from_connection_string(connection_string)
-    service.create_table_if_not_exists(TABLE_NAME)
-    return service.get_table_client(TABLE_NAME)
+    global _table_client_singleton
+    if _table_client_singleton is None:
+        connection_string = os.environ["AzureWebJobsStorage"]
+        service = TableServiceClient.from_connection_string(connection_string)
+        service.create_table_if_not_exists(TABLE_NAME)
+        _table_client_singleton = service.get_table_client(TABLE_NAME)
+    return _table_client_singleton
 
 
 def add_show(list_token: str, show_id: int, show_name: str) -> None:
     validate_token(list_token)
     client = _table_client()
+    row_key = str(show_id)
+
+    existing_keys = {
+        entity["RowKey"]
+        for entity in client.query_entities(f"PartitionKey eq '{list_token}'", select=["RowKey"])
+    }
+    if row_key not in existing_keys and len(existing_keys) >= MAX_WATCHLIST_SIZE:
+        raise WatchlistFull(f"A watchlist can have at most {MAX_WATCHLIST_SIZE} shows.")
+
     client.upsert_entity(
-        {"PartitionKey": list_token, "RowKey": str(show_id), "ShowName": show_name}
+        {"PartitionKey": list_token, "RowKey": row_key, "ShowName": show_name}
     )
 
 

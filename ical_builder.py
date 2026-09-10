@@ -1,6 +1,7 @@
 """Builds an iCalendar feed of episode air dates from TVMaze data."""
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -27,17 +28,27 @@ def build_calendar(shows_with_episodes: list[tuple[dict, list[dict]]]) -> Calend
 
 
 def build_event(show: dict, episode: dict) -> Event | None:
+    episode_id = episode.get("id")
     airstamp = episode.get("airstamp")
-    if not airstamp:
-        # Episode has no confirmed air date/time yet.
+    if episode_id is None or not airstamp:
+        # Episode has no confirmed air date/time yet, or isn't a real episode row.
         return None
 
-    start = datetime.fromisoformat(airstamp)
-    runtime_minutes = episode.get("runtime") or show.get("runtime") or DEFAULT_RUNTIME_MINUTES
+    try:
+        start = datetime.fromisoformat(airstamp)
+    except ValueError:
+        logging.warning("Skipping episode %s with unparseable airstamp %r", episode_id, airstamp)
+        return None
+
+    runtime_minutes = episode.get("runtime")
+    if runtime_minutes is None:
+        runtime_minutes = show.get("runtime")
+    if runtime_minutes is None:
+        runtime_minutes = DEFAULT_RUNTIME_MINUTES
     end = start + timedelta(minutes=runtime_minutes)
 
     event = Event()
-    event.add("uid", f"tvmaze-episode-{episode['id']}@tvcal")
+    event.add("uid", f"tvmaze-episode-{episode_id}@tvcal")
     event.add("summary", _format_episode_title(show, episode))
     event.add("dtstart", start)
     event.add("dtend", end)

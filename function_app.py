@@ -7,11 +7,13 @@ import azure.functions as func
 
 import storage
 from ical_builder import build_calendar
-from tvmaze_client import TVMazeError, get_show, get_show_episodes, search_shows
+from tvmaze_client import TVMazeError, get_show_with_episodes, search_shows
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
 STATIC_DIR = pathlib.Path(__file__).parent / "static"
+MAX_SHOW_NAME_LENGTH = 200
+MAX_SHOW_IDS_PARAM = 50
 
 
 @app.route(route="", methods=["GET"])
@@ -78,15 +80,26 @@ def watchlist_add(req: func.HttpRequest) -> func.HttpResponse:
 
     show_id = body.get("show_id")
     show_name = body.get("show_name")
-    if not isinstance(show_id, int) or not isinstance(show_name, str) or not show_name:
+    if (
+        not isinstance(show_id, int)
+        or isinstance(show_id, bool)
+        or show_id <= 0
+        or not isinstance(show_name, str)
+        or not show_name.strip()
+        or len(show_name) > MAX_SHOW_NAME_LENGTH
+    ):
         return func.HttpResponse(
-            "Body must include integer 'show_id' and non-empty 'show_name'.", status_code=400
+            "Body must include a positive integer 'show_id' and a non-empty 'show_name' "
+            f"(max {MAX_SHOW_NAME_LENGTH} characters).",
+            status_code=400,
         )
 
     try:
         storage.add_show(token, show_id, show_name)
     except storage.InvalidListToken as exc:
         return func.HttpResponse(str(exc), status_code=400)
+    except storage.WatchlistFull as exc:
+        return func.HttpResponse(str(exc), status_code=409)
 
     return func.HttpResponse(status_code=204)
 
@@ -131,30 +144,36 @@ def calendar_feed(req: func.HttpRequest) -> func.HttpResponse:
             return func.HttpResponse(str(exc), status_code=400)
     elif raw_ids:
         try:
-            show_ids = [int(value.strip()) for value in raw_ids.split(",") if value.strip()]
+            show_ids = list(
+                dict.fromkeys(int(value.strip()) for value in raw_ids.split(",") if value.strip())
+            )
         except ValueError:
             return func.HttpResponse(
                 "show_ids must be a comma-separated list of TVMaze show IDs.", status_code=400
             )
         if not show_ids:
             return func.HttpResponse("No valid show IDs supplied.", status_code=400)
+        if len(show_ids) > MAX_SHOW_IDS_PARAM:
+            return func.HttpResponse(
+                f"show_ids supports at most {MAX_SHOW_IDS_PARAM} shows per request.",
+                status_code=400,
+            )
     else:
         return func.HttpResponse(
             "Query parameter 'list' (watchlist token) or 'show_ids' is required.",
             status_code=400,
         )
 
+    # Best-effort: a single missing/broken show shouldn't blank out the whole
+    # subscription for every other show on the list.
     shows_with_episodes = []
-    try:
-        for show_id in show_ids:
-            show = get_show(show_id)
-            episodes = get_show_episodes(show_id)
-            shows_with_episodes.append((show, episodes))
-    except TVMazeError as exc:
-        return func.HttpResponse(str(exc), status_code=404)
-    except Exception:
-        logging.exception("TVMaze lookup failed for show_ids=%s", show_ids)
-        return func.HttpResponse("Failed to reach TVMaze.", status_code=502)
+    for show_id in show_ids:
+        try:
+            shows_with_episodes.append(get_show_with_episodes(show_id))
+        except TVMazeError:
+            logging.warning("Skipping unknown TVMaze show_id=%s", show_id)
+        except Exception:
+            logging.exception("TVMaze lookup failed for show_id=%s", show_id)
 
     calendar = build_calendar(shows_with_episodes)
     return func.HttpResponse(
