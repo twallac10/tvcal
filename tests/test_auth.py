@@ -74,6 +74,14 @@ def test_validate_username_rejects_invalid_formats(username):
         auth.validate_username(username)
 
 
+@pytest.mark.parametrize("username", ["__accounts__", "__feed_index__", "__meta__", "__ACCOUNTS__"])
+def test_validate_username_rejects_reserved_names(username):
+    # These are reserved Table Storage PartitionKeys/RowKeys elsewhere in
+    # storage.py; letting an account claim one would corrupt other data.
+    with pytest.raises(auth.InvalidUsername):
+        auth.validate_username(username)
+
+
 # -- accounts -----------------------------------------------------------
 
 

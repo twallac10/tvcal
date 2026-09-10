@@ -40,6 +40,14 @@ _META_ROW_KEY = "__meta__"
 _FEED_INDEX_PARTITION = "__feed_index__"
 _ACCOUNTS_PARTITION = "__accounts__"
 
+# A username IS a watchlist's PartitionKey now (see module docstring), so
+# none of these reserved sentinels -- each used elsewhere as a PartitionKey
+# or RowKey in this same table -- can ever be valid as a token/username.
+# Letting one through would let an account named e.g. "__accounts__"
+# silently read/corrupt the partition that stores every account's password
+# hash via ordinary watchlist calls (add_show/list_shows).
+RESERVED_TOKENS = frozenset({_META_ROW_KEY, _FEED_INDEX_PARTITION, _ACCOUNTS_PARTITION})
+
 _table_client_singleton = None
 _table_client_lock = threading.Lock()
 
@@ -69,9 +77,10 @@ class TooManyAccounts(Exception):
 
 
 def validate_token(token: str) -> None:
-    if not _TOKEN_RE.match(token or ""):
+    if not _TOKEN_RE.match(token or "") or token in RESERVED_TOKENS:
         raise InvalidListToken(
-            "token must be 1-100 characters of letters, digits, '-' or '_'."
+            "token must be 1-100 characters of letters, digits, '-' or '_', "
+            "and not a reserved name."
         )
 
 
@@ -216,11 +225,27 @@ def migrate_watchlist(old_token: str, new_username: str) -> None:
     account's watchlist (used once at signup to carry a browser's existing
     list forward). Leaves the old rows in place rather than deleting them --
     harmless, and safer if something goes wrong partway through.
+
+    `old_token` must NOT be a real account's username: since a username IS
+    a watchlist's PartitionKey, a naive copy would let anyone who knows (or
+    guesses) another user's username pass it as their own "previous_token"
+    at signup and silently copy that user's private watchlist into their
+    own account. This only ever migrates a genuinely anonymous, unclaimed
+    legacy token.
     """
     validate_token(old_token)
     validate_token(new_username)
     if old_token == new_username:
         return
+
+    try:
+        get_account(old_token)
+    except UnknownAccount:
+        pass
+    else:
+        # old_token belongs to a real account -- refuse to touch it.
+        return
+
     for show in list_shows(old_token):
         try:
             add_show(new_username, show["id"], show["name"])

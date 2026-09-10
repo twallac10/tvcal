@@ -269,3 +269,28 @@ def test_migrate_watchlist_stops_at_the_watchlist_cap(fake_client, monkeypatch):
     storage.migrate_watchlist("old-token-abc", "alice")
 
     assert len(storage.list_shows("alice")) == 1
+
+
+def test_migrate_watchlist_refuses_to_copy_from_a_real_account(fake_client):
+    # A username IS a watchlist's PartitionKey now -- migrate_watchlist must
+    # never let someone pass another real account's username as their own
+    # "previous_token" at signup and walk off with that account's shows.
+    storage.create_account("bob", "hash", "salt", 600_000)
+    storage.add_show("bob", 1, "Bob's Private Show")
+
+    storage.migrate_watchlist("bob", "attacker")
+
+    assert storage.list_shows("attacker") == []
+    assert storage.list_shows("bob") == [{"id": 1, "name": "Bob's Private Show"}]
+
+
+@pytest.mark.parametrize("reserved", ["__accounts__", "__feed_index__", "__meta__"])
+def test_reserved_tokens_are_rejected_everywhere(fake_client, reserved):
+    with pytest.raises(storage.InvalidListToken):
+        storage.add_show(reserved, 1, "Show")
+    with pytest.raises(storage.InvalidListToken):
+        storage.create_account(reserved, "hash", "salt", 600_000)
+    with pytest.raises(storage.InvalidListToken):
+        storage.migrate_watchlist(reserved, "alice")
+    with pytest.raises(storage.InvalidListToken):
+        storage.migrate_watchlist("some-legacy-token", reserved)

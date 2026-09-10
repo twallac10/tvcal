@@ -56,7 +56,15 @@ def validate_username(username: str) -> str:
         raise InvalidUsername(
             "Username must be 3-50 characters of letters, digits, '-' or '_'."
         )
-    return username.lower()
+    normalized = username.lower()
+    if normalized in storage.RESERVED_TOKENS:
+        # A username IS a watchlist's PartitionKey (see storage.py) -- these
+        # values are reserved elsewhere in the same table, so letting one
+        # through here would collide with them. storage.validate_token also
+        # rejects them as defense-in-depth, but catching it here gives a
+        # clear 400 at signup instead of a generic storage-level error.
+        raise InvalidUsername(f"Username '{username}' is reserved.")
+    return normalized
 
 
 def _session_secret() -> bytes:

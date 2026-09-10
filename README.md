@@ -61,8 +61,11 @@ valid session cookie (see **Signing in**).
   Creates an account (`password` must be 8+ characters, `username` 3-50
   characters of letters/digits/`-`/`_`) and signs you in. `previous_token`
   is optional — a pre-account browser's `tvcal_list_token`, folded into the
-  new account if given. `409` if the username's taken, `401` for a wrong
-  `signup_code`, `403` once `MAX_ACCOUNTS` is reached.
+  new account if given. It's silently ignored (no shows copied, signup
+  still succeeds) if it matches another real account's username, so it
+  can't be used to pull someone else's watchlist into your new account.
+  `409` if the username's taken, `401` for a wrong `signup_code`, `403`
+  once `MAX_ACCOUNTS` is reached.
 - `POST /auth/login` — body `{"username", "password"}`. Sets the session cookie.
 - `POST /auth/logout` — clears the session cookie.
 - `GET /auth/status` — `{"authenticated": bool, "username": str | null}` for
