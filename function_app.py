@@ -19,7 +19,7 @@ MAX_SHOW_IDS_PARAM = 50
 MAX_CONCURRENT_TVMAZE_FETCHES = 10
 
 
-@app.route(route="", methods=["GET"])
+@app.route(route="/", methods=["GET"])
 def index(req: func.HttpRequest) -> func.HttpResponse:
     """GET / -> the search + watchlist single-page UI."""
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
