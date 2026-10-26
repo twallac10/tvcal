@@ -12,6 +12,12 @@ storage.MAX_ACCOUNTS as a hard backstop) so it's still just the people you
 give the code to who can create accounts, not the whole internet. Rotate or
 blank out SIGNUP_CODE once everyone who needs an account has one.
 
+A session cookie carries the account's *session version*, and only
+authenticates while that still matches the account's. Changing a password
+bumps the version, signing that account out on every device -- and a
+deleted account's sessions stop working too. The cost is one account read
+per request.
+
 This deliberately does NOT gate /calendar.ics: that URL is fetched by
 external calendar apps with no cookies at all, and is already scoped by its
 own read-only feed token (see storage.py) -- a cookie-based login can't
@@ -34,6 +40,11 @@ import storage
 COOKIE_NAME = "tvcal_session"
 SESSION_LIFETIME_SECONDS = 30 * 24 * 60 * 60  # 30 days
 PBKDF2_ITERATIONS = 600_000
+MIN_PASSWORD_LENGTH = 8
+# Login and signup are anonymous and always run PBKDF2, so an unbounded
+# password would let anyone make the worker hash an arbitrarily large
+# string (a 50MB body OOMs a Consumption instance).
+MAX_PASSWORD_LENGTH = 1024
 
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_-]{3,50}$")
 
@@ -44,6 +55,10 @@ class AuthConfigError(Exception):
 
 class InvalidUsername(Exception):
     """Raised when a username fails basic format validation."""
+
+
+class InvalidPassword(Exception):
+    """Raised when a new password is too short or too long."""
 
 
 def _now() -> int:
@@ -65,6 +80,13 @@ def validate_username(username: str) -> str:
         # clear 400 at signup instead of a generic storage-level error.
         raise InvalidUsername(f"Username '{username}' is reserved.")
     return normalized
+
+
+def validate_new_password(password: str) -> None:
+    if not (MIN_PASSWORD_LENGTH <= len(password) <= MAX_PASSWORD_LENGTH):
+        raise InvalidPassword(
+            f"Password must be between {MIN_PASSWORD_LENGTH} and {MAX_PASSWORD_LENGTH} characters."
+        )
 
 
 def _session_secret() -> bytes:
@@ -96,6 +118,15 @@ def create_account(username: str, password: str) -> str:
     return username
 
 
+def change_password(username: str, new_password: str) -> None:
+    """Set a new password, signing the account out everywhere. `username`
+    must already be normalized (as get_username() returns it)."""
+    validate_new_password(new_password)
+    salt = secrets.token_bytes(16)
+    password_hash = _hash_password(new_password, salt, PBKDF2_ITERATIONS)
+    storage.set_password(username, password_hash, salt.hex(), PBKDF2_ITERATIONS)
+
+
 def verify_login(username: str, password: str) -> bool:
     try:
         username = validate_username(username)
@@ -116,13 +147,15 @@ def _sign(payload: str) -> str:
 
 
 def create_session_cookie(username: str) -> str:
-    """Return a Set-Cookie header value establishing a new session for `username`."""
-    # "." rather than ":" between username and expiry: Azure Functions'
-    # underlying host re-serializes a raw Set-Cookie header through its own
-    # .NET cookie-writer, which percent-encodes ":" (and anything else
-    # outside the URI "unreserved" set) but leaves "." untouched -- and our
-    # server-side parser below never URL-decodes the value it reads back.
-    payload = f"{username}.{_now() + SESSION_LIFETIME_SECONDS}"
+    """Return a Set-Cookie header value establishing a new session for
+    `username` (an existing account, at its current session version)."""
+    # username.version.expiry, joined with "." rather than ":": Azure
+    # Functions' underlying host re-serializes a raw Set-Cookie header
+    # through its own .NET cookie-writer, which percent-encodes ":" (and
+    # anything else outside the URI "unreserved" set) but leaves "."
+    # untouched -- and our parser below never URL-decodes what it reads back.
+    session_version = storage.get_account(username)["session_version"]
+    payload = f"{username}.{session_version}.{_now() + SESSION_LIFETIME_SECONDS}"
     token = _sign(payload)
     return (
         f"{COOKIE_NAME}={token}; Path=/; HttpOnly; Secure; SameSite=Strict; "
@@ -148,7 +181,8 @@ def _extract_cookie(req: func.HttpRequest) -> str | None:
 
 def _parse_session_cookie(req: func.HttpRequest) -> str | None:
     """Return the session's username if the cookie is present, well-formed,
-    correctly signed, and unexpired -- otherwise None."""
+    correctly signed, unexpired, and still current for its account --
+    otherwise None."""
     token = _extract_cookie(req)
     if not token:
         return None
@@ -156,10 +190,12 @@ def _parse_session_cookie(req: func.HttpRequest) -> str | None:
     payload, sep, signature = token.rpartition(".")
     if not sep:
         return None
-    username, sep, expiry_str = payload.rpartition(".")
-    if not sep:
+    parts = payload.split(".")
+    if len(parts) != 3:
         return None
+    username, version_str, expiry_str = parts
     try:
+        session_version = int(version_str)
         expiry = int(expiry_str)
     except ValueError:
         return None
@@ -173,16 +209,41 @@ def _parse_session_cookie(req: func.HttpRequest) -> str | None:
         return None
     if not hmac.compare_digest(signature.encode("utf-8"), expected_signature.encode("utf-8")):
         return None
+
+    # Correctly signed isn't enough: the account must still exist, and its
+    # password must not have changed since this session began.
+    try:
+        account = storage.get_account(username)
+    except (storage.UnknownAccount, storage.InvalidListToken):
+        return None
+    if account["session_version"] != session_version:
+        return None
     return username
 
 
+_SESSION_ATTR = "_tvcal_session_username"
+
+
 def is_authenticated(req: func.HttpRequest) -> bool:
-    return _parse_session_cookie(req) is not None
+    return get_username(req) is not None
 
 
 def get_username(req: func.HttpRequest) -> str | None:
-    """Return the signed-in username for a valid session, else None."""
-    return _parse_session_cookie(req)
+    """Return the signed-in username for a valid session, else None.
+
+    Remembered on the request, since checking a session reads the account
+    and both require_session and the handler ask.
+    """
+    try:
+        return getattr(req, _SESSION_ATTR)
+    except AttributeError:
+        pass
+    username = _parse_session_cookie(req)
+    try:
+        setattr(req, _SESSION_ATTR, username)
+    except AttributeError:
+        pass  # this request type can't hold it; it just gets checked again
+    return username
 
 
 def require_session(handler):

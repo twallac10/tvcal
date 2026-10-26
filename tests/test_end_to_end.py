@@ -167,3 +167,37 @@ def test_signups_are_closed_when_no_signup_code_is_configured(fake_client, monke
     ).encode()
 
     assert function_app.auth_signup(_request("POST", "auth/signup", body=body)).status_code == 403
+
+
+
+def _login(username, password):
+    body = json.dumps({"username": username, "password": password}).encode()
+    response = function_app.auth_login(_request("POST", "auth/login", body=body))
+    cookie = response.headers.get("Set-Cookie", "").split(";")[0] if response.status_code == 204 else None
+    return response.status_code, cookie
+
+
+def test_changing_the_password_signs_out_every_other_device(fake_client):
+    _signup("alice")
+    _, phone = _login("alice", PASSWORD)
+    _, laptop = _login("alice", PASSWORD)
+    _signup("bob")
+    _, bob = _login("bob", PASSWORD)
+
+    body = json.dumps({"current_password": PASSWORD, "new_password": "a-whole-new-password"}).encode()
+    response = function_app.auth_change_password(
+        _request("POST", "auth/change-password", cookie=laptop, body=body)
+    )
+    assert response.status_code == 204
+    laptop_after = response.headers["Set-Cookie"].split(";")[0]
+
+    def status(cookie):
+        return function_app.watchlist_get(_request("GET", "watchlist", cookie=cookie)).status_code
+
+    assert status(phone) == 401  # signed out
+    assert status(laptop) == 401  # the old cookie is dead too...
+    assert status(laptop_after) == 200  # ...but this device got a new one
+    assert status(bob) == 200  # other accounts are untouched
+
+    assert _login("alice", PASSWORD)[0] == 401
+    assert _login("alice", "a-whole-new-password")[0] == 204

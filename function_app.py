@@ -27,11 +27,6 @@ STATIC_DIR = pathlib.Path(__file__).parent / "static"
 MAX_SHOW_NAME_LENGTH = 200
 MAX_SHOW_ID = 10**15
 MAX_CONCURRENT_TVMAZE_FETCHES = 10
-MIN_PASSWORD_LENGTH = 8
-# /auth/login and /auth/signup are anonymous and always run PBKDF2, so an
-# unbounded password would let anyone make the worker hash an arbitrarily
-# large string (a 50MB body OOMs a Consumption instance).
-MAX_PASSWORD_LENGTH = 1024
 # How long a request's TVMaze lookups may take in total -- waiting on the
 # rate limit and downloading -- before it answers without the stragglers.
 # For search and the watchlist those just show no airdate (and still finish
@@ -92,12 +87,10 @@ def auth_signup(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(
             "Body must include 'username', 'password', and 'signup_code'.", status_code=400
         )
-    if not (MIN_PASSWORD_LENGTH <= len(password) <= MAX_PASSWORD_LENGTH):
-        return func.HttpResponse(
-            f"Password must be between {MIN_PASSWORD_LENGTH} and "
-            f"{MAX_PASSWORD_LENGTH} characters.",
-            status_code=400,
-        )
+    try:
+        auth.validate_new_password(password)
+    except auth.InvalidPassword as exc:
+        return func.HttpResponse(str(exc), status_code=400)
 
     try:
         code_ok = auth.check_signup_code(signup_code)
@@ -138,8 +131,8 @@ def auth_login(req: func.HttpRequest) -> func.HttpResponse:
     password = body.get("password")
     if not isinstance(username, str) or not username or not isinstance(password, str) or not password:
         return func.HttpResponse("Body must include 'username' and 'password'.", status_code=400)
-    if len(password) > MAX_PASSWORD_LENGTH:
-        # Reject before hashing -- see MAX_PASSWORD_LENGTH above.
+    if len(password) > auth.MAX_PASSWORD_LENGTH:
+        # Reject before hashing -- see auth.MAX_PASSWORD_LENGTH.
         return func.HttpResponse("Incorrect username or password.", status_code=401)
 
     try:
@@ -159,6 +152,45 @@ def auth_login(req: func.HttpRequest) -> func.HttpResponse:
 def auth_logout(req: func.HttpRequest) -> func.HttpResponse:
     """POST /auth/logout -> clears the session cookie."""
     return func.HttpResponse(status_code=204, headers={"Set-Cookie": auth.clear_session_cookie()})
+
+
+@app.route(route="auth/change-password", methods=["POST"])
+@auth.require_session
+def auth_change_password(req: func.HttpRequest) -> func.HttpResponse:
+    """POST /auth/change-password  body: {"current_password", "new_password"}.
+
+    Signs the account out on every other device -- the point, if someone
+    else might know the old password -- and returns a fresh session cookie
+    so this one stays signed in.
+    """
+    body = _json_object(req)
+    if body is None:
+        return func.HttpResponse("Request body must be a JSON object.", status_code=400)
+
+    current_password = body.get("current_password")
+    new_password = body.get("new_password")
+    if not isinstance(current_password, str) or not current_password or not isinstance(new_password, str):
+        return func.HttpResponse(
+            "Body must include 'current_password' and 'new_password'.", status_code=400
+        )
+    try:
+        auth.validate_new_password(new_password)
+    except auth.InvalidPassword as exc:
+        return func.HttpResponse(str(exc), status_code=400)
+
+    username = auth.get_username(req)
+    # 403, not 401: the session itself is fine (the UI treats 401 as
+    # "signed out"). Oversized input is refused before hashing, as at login.
+    if len(current_password) > auth.MAX_PASSWORD_LENGTH or not auth.verify_login(
+        username, current_password
+    ):
+        return func.HttpResponse("Current password is incorrect.", status_code=403)
+
+    try:
+        auth.change_password(username, new_password)
+    except storage.AccountBusy as exc:
+        return func.HttpResponse(str(exc), status_code=409)
+    return func.HttpResponse(status_code=204, headers={"Set-Cookie": auth.create_session_cookie(username)})
 
 
 @app.route(route="auth/status", methods=["GET"])

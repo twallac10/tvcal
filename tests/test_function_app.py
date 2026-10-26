@@ -249,6 +249,7 @@ def test_protected_routes_return_401_without_a_session(monkeypatch):
             _request("DELETE", "watchlist/1", route_params={"show_id": "1"})
         ),
         lambda: function_app.search(_request("GET", "shows/search", params={"q": "fringe"})),
+        lambda: function_app.auth_change_password(_request("POST", "auth/change-password", body=b"{}")),
     ]
     for call in protected:
         assert call().status_code == 401
@@ -890,3 +891,50 @@ def test_calendar_feed_lookups_share_one_overall_time_budget(monkeypatch):
     function_app.calendar_feed(_request("GET", "calendar.ics", params={"feed": feed_token}))
 
     assert len(deadlines) == 1 and None not in deadlines
+
+
+# -- change password ---------------------------------------------------------
+
+
+def _change_password(current="old-password", new="a-new-password"):
+    body = json.dumps({"current_password": current, "new_password": new}).encode()
+    return function_app.auth_change_password(_request("POST", "auth/change-password", body=body))
+
+
+def test_change_password_sets_it_and_reissues_this_devices_session(monkeypatch):
+    changed = []
+    monkeypatch.setattr(auth, "verify_login", lambda username, password: (username, password) == ("testuser", "old-password"))
+    monkeypatch.setattr(auth, "change_password", lambda username, new: changed.append((username, new)))
+    monkeypatch.setattr(auth, "create_session_cookie", lambda username: f"tvcal_session=fresh-{username}")
+
+    response = _change_password()
+
+    assert response.status_code == 204
+    assert changed == [("testuser", "a-new-password")]
+    assert response.headers["Set-Cookie"] == "tvcal_session=fresh-testuser"
+
+
+def test_change_password_refuses_a_wrong_current_password_with_403_not_401(monkeypatch):
+    # 401 would make the UI think the session ended and show the login form.
+    monkeypatch.setattr(auth, "verify_login", lambda username, password: False)
+    monkeypatch.setattr(auth, "change_password", lambda *a: (_ for _ in ()).throw(AssertionError("changed")))
+
+    assert _change_password(current="wrong").status_code == 403
+
+
+def test_change_password_checks_the_new_password_before_anything_else(monkeypatch):
+    monkeypatch.setattr(auth, "verify_login", lambda *a: (_ for _ in ()).throw(AssertionError("hashed")))
+
+    assert _change_password(new="short").status_code == 400
+
+
+def test_change_password_rejects_an_oversized_current_password_without_hashing(monkeypatch):
+    monkeypatch.setattr(auth, "verify_login", lambda *a: (_ for _ in ()).throw(AssertionError("hashed")))
+
+    assert _change_password(current="x" * 100_000).status_code == 403
+
+
+def test_change_password_rejects_malformed_bodies():
+    for body in (b"not json", b"[]", b"{}", b'{"current_password": "x"}'):
+        response = function_app.auth_change_password(_request("POST", "auth/change-password", body=body))
+        assert response.status_code == 400, body

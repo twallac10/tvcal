@@ -9,3 +9,4 @@ local.settings.json.example
 venv/
 requirements-dev.txt
 README.md
+scripts/

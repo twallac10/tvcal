@@ -134,7 +134,12 @@ def test_create_and_get_account(fake_client):
     storage.create_account("alice", "hash123", "salt456", 600_000)
 
     account = storage.get_account("alice")
-    assert account == {"password_hash": "hash123", "salt": "salt456", "iterations": 600_000}
+    assert account == {
+        "password_hash": "hash123",
+        "salt": "salt456",
+        "iterations": 600_000,
+        "session_version": 0,
+    }
 
 
 def test_get_unknown_account_raises(fake_client):
@@ -170,6 +175,7 @@ def test_accounts_partition_does_not_collide_with_a_same_named_watchlist(fake_cl
         "password_hash": "hash1",
         "salt": "salt1",
         "iterations": 600_000,
+        "session_version": 0,
     }
 
 
@@ -279,3 +285,56 @@ def test_concurrent_resets_leave_no_token_that_cant_be_revoked(fake_client, monk
     assert this_tab == other_tab["token"] == current
     resolvable = {row_key for (partition, row_key) in fake_client.rows if partition == "__feed_index__"}
     assert resolvable == {current}
+
+
+# -- set_password -------------------------------------------------------
+
+
+def test_accounts_from_before_session_versions_start_at_zero(fake_client):
+    # Rows written before this change have no SessionVersion column.
+    fake_client.upsert_entity(
+        {"PartitionKey": "__accounts__", "RowKey": "alice", "PasswordHash": "h", "Salt": "s", "Iterations": 1}
+    )
+    assert storage.get_account("alice")["session_version"] == 0
+
+
+def test_set_password_replaces_the_hash_and_bumps_the_session_version(fake_client):
+    storage.create_account("alice", "old-hash", "old-salt", 600_000)
+
+    storage.set_password("alice", "new-hash", "new-salt", 700_000)
+
+    assert storage.get_account("alice") == {
+        "password_hash": "new-hash",
+        "salt": "new-salt",
+        "iterations": 700_000,
+        "session_version": 1,
+    }
+
+
+def test_set_password_for_an_unknown_account_raises(fake_client):
+    with pytest.raises(storage.UnknownAccount):
+        storage.set_password("nobody", "h", "s", 1)
+
+
+def test_concurrent_password_changes_both_bump_the_session_version(fake_client, monkeypatch):
+    # Without a conditional write, two changes at once could both write
+    # version 1 -- and a session started by the losing change would then
+    # still be valid under the winning password.
+    storage.create_account("alice", "h0", "s0", 1)
+    real_get_entity = fake_client.get_entity
+    raced = []
+
+    def get_entity_then_race(partition_key, row_key):
+        entity = real_get_entity(partition_key, row_key)
+        if partition_key == "__accounts__" and not raced:
+            raced.append(True)
+            storage.set_password("alice", "h-other", "s-other", 1)  # lands in between
+        return entity
+
+    monkeypatch.setattr(fake_client, "get_entity", get_entity_then_race)
+    storage.set_password("alice", "h-mine", "s-mine", 1)
+    monkeypatch.setattr(fake_client, "get_entity", real_get_entity)
+
+    account = storage.get_account("alice")
+    assert account["session_version"] == 2
+    assert account["password_hash"] == "h-mine"

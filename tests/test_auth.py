@@ -40,16 +40,37 @@ def fake_accounts(monkeypatch):
             "password_hash": password_hash,
             "salt": salt,
             "iterations": iterations,
+            "session_version": 0,
         }
 
     def fake_get_account(username):
         if username not in accounts:
             raise storage.UnknownAccount(f"No account for username '{username}'.")
-        return accounts[username]
+        return dict(accounts[username])
+
+    def fake_set_password(username, password_hash, salt, iterations):
+        account = accounts[username]
+        account.update(password_hash=password_hash, salt=salt, iterations=iterations)
+        account["session_version"] += 1
 
     monkeypatch.setattr(storage, "create_account", fake_create_account)
     monkeypatch.setattr(storage, "get_account", fake_get_account)
+    monkeypatch.setattr(storage, "set_password", fake_set_password)
     return accounts
+
+
+@pytest.fixture
+def accounts(fake_accounts):
+    """Existing accounts to hold sessions for -- added directly rather than
+    through create_account, which would spend real PBKDF2 time on each."""
+    for username in ("alice", "bob", "alice-under_score"):
+        fake_accounts[username] = {
+            "password_hash": "unused",
+            "salt": "00",
+            "iterations": 1,
+            "session_version": 0,
+        }
+    return fake_accounts
 
 
 def _request_with_cookie(cookie_header=None):
@@ -60,7 +81,7 @@ def _request_with_cookie(cookie_header=None):
 
 
 def _cookie_token(set_cookie_header):
-    # e.g. "tvcal_session=<user>.<expiry>.<sig>; Path=/; HttpOnly; ..." -> "<user>.<expiry>.<sig>"
+    # "tvcal_session=<user>.<version>.<expiry>.<sig>; Path=/; ..." -> "<user>.<version>.<expiry>.<sig>"
     return set_cookie_header.split(";")[0].split("=", 1)[1]
 
 
@@ -143,7 +164,7 @@ def test_check_signup_code_raises_when_unconfigured(monkeypatch):
 # -- session cookie -------------------------------------------------------
 
 
-def test_session_cookie_value_contains_only_uri_unreserved_characters():
+def test_session_cookie_value_contains_only_uri_unreserved_characters(accounts):
     # Azure Functions' host re-serializes Set-Cookie through its own .NET
     # cookie writer, which percent-encodes anything outside the URI
     # "unreserved" set (letters, digits, -._~) -- e.g. ":" silently became
@@ -155,7 +176,7 @@ def test_session_cookie_value_contains_only_uri_unreserved_characters():
     assert set(token) <= _URI_UNRESERVED
 
 
-def test_session_cookie_round_trips_to_username():
+def test_session_cookie_round_trips_to_username(accounts):
     token = _cookie_token(auth.create_session_cookie("alice"))
     req = _request_with_cookie(f"{auth.COOKIE_NAME}={token}")
 
@@ -168,7 +189,7 @@ def test_is_authenticated_false_without_cookie():
     assert auth.get_username(_request_with_cookie()) is None
 
 
-def test_is_authenticated_false_with_tampered_signature():
+def test_is_authenticated_false_with_tampered_signature(accounts):
     token = _cookie_token(auth.create_session_cookie("alice"))
     payload, _, signature = token.rpartition(".")
     tampered = f"{payload}.{'0' * len(signature)}"
@@ -178,7 +199,7 @@ def test_is_authenticated_false_with_tampered_signature():
     assert auth.get_username(req) is None
 
 
-def test_is_authenticated_false_when_expired(monkeypatch):
+def test_is_authenticated_false_when_expired(accounts, monkeypatch):
     monkeypatch.setattr(auth, "_now", lambda: 1_000_000_000)
     token = _cookie_token(auth.create_session_cookie("alice"))
 
@@ -188,7 +209,7 @@ def test_is_authenticated_false_when_expired(monkeypatch):
     assert auth.is_authenticated(req) is False
 
 
-def test_is_authenticated_false_when_session_secret_missing(monkeypatch):
+def test_is_authenticated_false_when_session_secret_missing(accounts, monkeypatch):
     token = _cookie_token(auth.create_session_cookie("alice"))
     monkeypatch.delenv("SESSION_SECRET", raising=False)
     req = _request_with_cookie(f"{auth.COOKIE_NAME}={token}")
@@ -203,7 +224,7 @@ def test_cleared_session_cookie_is_not_authenticated():
     assert auth.is_authenticated(req) is False
 
 
-def test_two_accounts_get_independent_sessions():
+def test_two_accounts_get_independent_sessions(accounts):
     alice_token = _cookie_token(auth.create_session_cookie("alice"))
     bob_token = _cookie_token(auth.create_session_cookie("bob"))
 
@@ -243,3 +264,70 @@ def test_require_session_allows_authenticated(monkeypatch):
 def test_a_cookie_with_a_non_ascii_signature_is_rejected_not_500ed():
     req = _request_with_cookie("tvcal_session=alice.9999999999.é")
     assert auth.get_username(req) is None
+
+
+
+# -- versioned sessions and password changes -----------------------------
+
+
+def _session_request(username):
+    token = _cookie_token(auth.create_session_cookie(username))
+    return lambda: _request_with_cookie(f"{auth.COOKIE_NAME}={token}")
+
+
+def test_changing_the_password_signs_out_existing_sessions(accounts):
+    old_session = _session_request("alice")
+    assert auth.get_username(old_session()) == "alice"
+
+    auth.change_password("alice", "a-brand-new-password")
+
+    assert auth.get_username(old_session()) is None
+    assert auth.get_username(_session_request("alice")()) == "alice"  # a new one works
+
+
+def test_changing_one_accounts_password_leaves_other_accounts_signed_in(accounts):
+    bob = _session_request("bob")
+    auth.change_password("alice", "a-brand-new-password")
+    assert auth.get_username(bob()) == "bob"
+
+
+def test_a_deleted_accounts_sessions_stop_working(accounts):
+    session = _session_request("alice")
+    del accounts["alice"]
+    assert auth.get_username(session()) is None
+
+
+def test_a_cookie_in_the_old_unversioned_format_is_rejected(accounts):
+    # username.expiry, correctly signed: what a pre-versioning build issued.
+    payload = f"alice.{auth._now() + 60}"
+    req = _request_with_cookie(f"{auth.COOKIE_NAME}={auth._sign(payload)}")
+    assert auth.get_username(req) is None
+
+
+def test_change_password_then_login_uses_the_new_password(fake_accounts):
+    auth.create_account("alice", "the-old-password")
+
+    auth.change_password("alice", "the-new-password")
+
+    assert auth.verify_login("alice", "the-new-password") is True
+    assert auth.verify_login("alice", "the-old-password") is False
+
+
+@pytest.mark.parametrize("password", ["short", "x" * (auth.MAX_PASSWORD_LENGTH + 1)])
+def test_change_password_enforces_the_length_rules(accounts, password):
+    with pytest.raises(auth.InvalidPassword):
+        auth.change_password("alice", password)
+    assert accounts["alice"]["session_version"] == 0
+
+
+def test_a_request_checks_its_session_against_storage_only_once(accounts, monkeypatch):
+    # require_session and the handler both ask for the username; checking
+    # the account twice per request would double the storage reads.
+    req = _session_request("alice")()
+    reads = []
+    real_get_account = storage.get_account
+    monkeypatch.setattr(storage, "get_account", lambda u: reads.append(u) or real_get_account(u))
+
+    assert auth.is_authenticated(req) is True
+    assert auth.get_username(req) == "alice"
+    assert reads == ["alice"]
