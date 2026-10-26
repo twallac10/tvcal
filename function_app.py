@@ -12,6 +12,7 @@ import auth
 import storage
 from ical_builder import build_calendar
 from tvmaze_client import (
+    EPISODE_HISTORY_DAYS,
     TVMazeBusy,
     TVMazeError,
     get_show_with_episodes,
@@ -31,16 +32,16 @@ MIN_PASSWORD_LENGTH = 8
 # unbounded password would let anyone make the worker hash an arbitrarily
 # large string (a 50MB body OOMs a Consumption instance).
 MAX_PASSWORD_LENGTH = 1024
-# How long a page's airdate lookups may wait on TVMaze's rate limit before
-# giving up on the shows still pending (they just show no airdate). The
-# search page is interactive, so it gets less patience than the watchlist.
-SEARCH_LOOKUP_WAIT_SECONDS = 3
+# How long a request's TVMaze lookups may take in total -- waiting on the
+# rate limit and downloading -- before it answers without the stragglers.
+# For search and the watchlist those just show no airdate (and still finish
+# in the background, warming the cache); the search page is interactive, so
+# it gets less patience than the watchlist.
+SEARCH_LOOKUP_WAIT_SECONDS = 5
 WATCHLIST_LOOKUP_WAIT_SECONDS = 20
 # The calendar can't skip a show, so it waits as long as a full 100-show
 # watchlist needs (~55s paced), within Azure's 230s HTTP request limit.
 CALENDAR_LOOKUP_WAIT_SECONDS = 150
-# Episodes older than this drop out of the calendar feed.
-CALENDAR_HISTORY_DAYS = 30
 
 
 def _json_object(req: func.HttpRequest) -> dict | None:
@@ -214,24 +215,36 @@ def _might_have_upcoming_episodes(show: dict) -> bool:
     return show.get("status") != "Ended"
 
 
-def _fetch_shows(show_ids: list[int], deadline: float | None = None) -> dict:
+def _fetch_shows(show_ids: list[int], deadline: float) -> dict:
     """Look up shows on TVMaze concurrently: show_id -> (show, episodes), or
-    the exception that show's lookup raised. `deadline` is passed through to
-    get_show_with_episodes()."""
+    the exception that show's lookup raised. A lookup still running at
+    `deadline` (a time.monotonic() value) maps to TVMazeBusy -- the deadline
+    bounds this call's total time, not just rate-limit waits."""
     found = {}
     if not show_ids:
         return found
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TVMAZE_FETCHES) as pool:
-        future_to_show_id = {
-            pool.submit(get_show_with_episodes, show_id, deadline=deadline): show_id
-            for show_id in show_ids
-        }
-        for future in concurrent.futures.as_completed(future_to_show_id):
-            show_id = future_to_show_id[future]
-            try:
-                found[show_id] = future.result()
-            except Exception as exc:
-                found[show_id] = exc
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TVMAZE_FETCHES)
+    future_to_show_id = {
+        pool.submit(get_show_with_episodes, show_id, deadline=deadline): show_id
+        for show_id in show_ids
+    }
+    try:
+        done, _ = concurrent.futures.wait(
+            future_to_show_id, timeout=max(0.0, deadline - time.monotonic())
+        )
+    finally:
+        # Don't wait for stragglers: lookups already running finish in the
+        # background (and still fill the cache), queued ones are dropped.
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    for future, show_id in future_to_show_id.items():
+        if future not in done:
+            found[show_id] = TVMazeBusy(f"Ran out of time looking up show_id={show_id}.")
+            continue
+        try:
+            found[show_id] = future.result()
+        except Exception as exc:
+            found[show_id] = exc
     return found
 
 
@@ -438,8 +451,7 @@ def calendar_feed(req: func.HttpRequest) -> func.HttpResponse:
 
     calendar = build_calendar(
         shows_with_episodes,
-        name=_calendar_name(write_token),
-        since=datetime.now(timezone.utc) - timedelta(days=CALENDAR_HISTORY_DAYS),
+        since=datetime.now(timezone.utc) - timedelta(days=EPISODE_HISTORY_DAYS),
     )
     return func.HttpResponse(
         calendar.to_ical(),
@@ -447,14 +459,3 @@ def calendar_feed(req: func.HttpRequest) -> func.HttpResponse:
         mimetype="text/calendar",
         headers={"Content-Disposition": "inline; filename=tv-shows.ics"},
     )
-
-
-def _calendar_name(list_token: str) -> str:
-    # Names each person's calendar after them, so two people's feeds are
-    # distinguishable in a calendar app. A pre-account watchlist's token
-    # isn't a name, so it gets the plain default.
-    try:
-        storage.get_account(list_token)
-    except storage.UnknownAccount:
-        return "TV Cal"
-    return f"TV Cal ({list_token})"

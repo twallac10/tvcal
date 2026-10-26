@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from icalendar import Calendar, Event
 
-from tvmaze_client import network_name
+from tvmaze_client import is_all_day, network_name
 
 DEFAULT_RUNTIME_MINUTES = 30
 _HTML_TAG_RE = re.compile(r"<[^<]+?>")
@@ -80,12 +80,10 @@ def build_event(show: dict, episode: dict, since: datetime | None = None) -> Eve
     event.add("uid", f"tvmaze-episode-{episode_id}@tvcal")
     event.add("summary", _format_episode_title(show, episode))
 
-    airdate = episode.get("airdate")
-    if not episode.get("airtime") and isinstance(airdate, str) and airdate:
-        # No announced time -- typical of streaming drops -- means the
-        # airstamp's hour is a placeholder, so an all-day event on the
+    if is_all_day(episode):
+        # The airstamp's hour is a placeholder, so an all-day event on the
         # release date is the honest version.
-        day = date.fromisoformat(airdate)
+        day = date.fromisoformat(episode["airdate"])
         event.add("dtstart", day)
         event.add("dtend", day + timedelta(days=1))
     else:

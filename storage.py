@@ -22,8 +22,9 @@ import re
 import secrets
 import threading
 
-from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
-from azure.data.tables import TableServiceClient
+from azure.core import MatchConditions
+from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
+from azure.data.tables import TableServiceClient, UpdateMode
 
 TABLE_NAME = "watchlistshows"
 MAX_WATCHLIST_SIZE = 100
@@ -192,22 +193,45 @@ def reset_feed_token(list_token: str) -> str:
     validate_token(list_token)
     client = _table_client()
     try:
-        old_feed_token = client.get_entity(partition_key=list_token, row_key=_META_ROW_KEY)["FeedToken"]
+        meta = client.get_entity(partition_key=list_token, row_key=_META_ROW_KEY)
     except ResourceNotFoundError:
-        old_feed_token = None
+        meta = None
 
     feed_token = secrets.token_urlsafe(24)
     # Same ordering as get_or_create_feed_token: index row before the meta
     # row that hands the token out, so a failure in between can't leave a
     # link that never resolves.
     _ensure_feed_index(client, feed_token, list_token)
-    client.upsert_entity({"PartitionKey": list_token, "RowKey": _META_ROW_KEY, "FeedToken": feed_token})
-    if old_feed_token is not None:
-        try:
-            client.delete_entity(partition_key=_FEED_INDEX_PARTITION, row_key=old_feed_token)
-        except ResourceNotFoundError:
-            pass
+    new_meta = {"PartitionKey": list_token, "RowKey": _META_ROW_KEY, "FeedToken": feed_token}
+    try:
+        if meta is None:
+            client.create_entity(new_meta)
+        else:
+            # Conditional on the meta row we read. Two resets at once (two
+            # tabs) would otherwise both "win": the overwritten one's token
+            # would keep resolving, with no meta row pointing at it for a
+            # later reset to revoke.
+            client.update_entity(
+                new_meta,
+                mode=UpdateMode.REPLACE,
+                etag=meta.metadata["etag"],
+                match_condition=MatchConditions.IfNotModified,
+            )
+    except (ResourceExistsError, ResourceModifiedError):
+        # Lost to a concurrent reset: withdraw ours and use theirs.
+        _delete_feed_index(client, feed_token)
+        return client.get_entity(partition_key=list_token, row_key=_META_ROW_KEY)["FeedToken"]
+
+    if meta is not None:
+        _delete_feed_index(client, meta["FeedToken"])
     return feed_token
+
+
+def _delete_feed_index(client, feed_token: str) -> None:
+    try:
+        client.delete_entity(partition_key=_FEED_INDEX_PARTITION, row_key=feed_token)
+    except ResourceNotFoundError:
+        pass
 
 
 def resolve_feed_token(feed_token: str) -> str:

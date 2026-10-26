@@ -1,17 +1,33 @@
-from datetime import datetime, timezone
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
+import requests
 
 import tvmaze_client
-from tvmaze_client import TVMazeError, get_show_with_episodes, search_shows, upcoming_episodes
+from tvmaze_client import (
+    EPISODE_HISTORY_DAYS,
+    TVMazeBusy,
+    TVMazeError,
+    get_show_with_episodes,
+    search_shows,
+    upcoming_episodes,
+)
 
 BASE_URL = "https://api.tvmaze.com"
 
 
 @pytest.fixture(autouse=True)
 def no_retry_sleep(monkeypatch):
-    """Keep the 429 retry path from actually sleeping during tests."""
-    monkeypatch.setattr(tvmaze_client.time, "sleep", lambda seconds: None)
+    """Keep the 429 retry path from actually sleeping during tests. Swaps
+    the module's `time` reference rather than patching the global time
+    module, which every other thread in the process shares."""
+    monkeypatch.setattr(
+        tvmaze_client, "time", SimpleNamespace(monotonic=time.monotonic, sleep=lambda seconds: None)
+    )
 
 
 def test_search_shows_returns_show_objects(requests_mock):
@@ -32,14 +48,14 @@ def test_get_show_with_episodes_splits_embedded_episodes_from_show(requests_mock
         json={
             "id": 82,
             "name": "Fringe",
-            "_embedded": {"episodes": [{"id": 1, "name": "Pilot"}]},
+            "_embedded": {"episodes": [{"id": 1, "name": "Pilot", "airstamp": "2099-01-01T01:00:00+00:00"}]},
         },
     )
 
     show, episodes = get_show_with_episodes(82)
 
     assert show == {"id": 82, "name": "Fringe"}
-    assert episodes == [{"id": 1, "name": "Pilot"}]
+    assert episodes == [{"id": 1, "name": "Pilot", "airstamp": "2099-01-01T01:00:00+00:00"}]
     assert requests_mock.last_request.qs["embed"] == ["episodes"]
 
 
@@ -71,7 +87,7 @@ def test_rate_limited_request_is_retried_and_succeeds(requests_mock):
 def test_persistent_rate_limiting_eventually_raises(requests_mock):
     requests_mock.get(f"{BASE_URL}/shows/82", status_code=429)
 
-    with pytest.raises(Exception):
+    with pytest.raises(requests.HTTPError):
         get_show_with_episodes(82)
 
 
@@ -93,8 +109,8 @@ def test_upcoming_episodes_returns_the_next_two_soonest_first():
     ]
 
     assert upcoming_episodes(episodes, NOW) == [
-        {"airstamp": "2026-10-27T01:00:00+00:00", "season": 2, "number": 1},
-        {"airstamp": "2026-11-02T01:00:00+00:00", "season": 2, "number": 2},
+        {"airstamp": "2026-10-27T01:00:00+00:00", "airdate": None, "season": 2, "number": 1},
+        {"airstamp": "2026-11-02T01:00:00+00:00", "airdate": None, "season": 2, "number": 2},
     ]
 
 
@@ -104,7 +120,7 @@ def test_upcoming_episodes_is_empty_when_everything_has_aired():
 
 def test_upcoming_episodes_treats_a_naive_airstamp_as_utc():
     assert upcoming_episodes([_ep("2026-10-27T01:00:00")], NOW) == [
-        {"airstamp": "2026-10-27T01:00:00+00:00", "season": 1, "number": 1}
+        {"airstamp": "2026-10-27T01:00:00+00:00", "airdate": None, "season": 1, "number": 1}
     ]
 
 
@@ -120,7 +136,7 @@ def test_upcoming_episodes_skips_malformed_data_instead_of_raising():
     # The one usable episode survives; its non-int season/number are
     # dropped rather than passed through to the UI.
     assert upcoming_episodes(episodes, NOW) == [
-        {"airstamp": "2026-10-27T01:00:00+00:00", "season": None, "number": None}
+        {"airstamp": "2026-10-27T01:00:00+00:00", "airdate": None, "season": None, "number": None}
     ]
     assert upcoming_episodes("not a list", NOW) == []
 
@@ -146,8 +162,7 @@ class FakeClock:
 @pytest.fixture
 def clock(monkeypatch):
     fake = FakeClock()
-    monkeypatch.setattr(tvmaze_client.time, "monotonic", fake.monotonic)
-    monkeypatch.setattr(tvmaze_client.time, "sleep", fake.sleep)
+    monkeypatch.setattr(tvmaze_client, "time", SimpleNamespace(monotonic=fake.monotonic, sleep=fake.sleep))
     return fake
 
 
@@ -199,7 +214,7 @@ def test_rate_limited_request_is_retried_several_times(clock, requests_mock):
 def test_rate_limit_retries_stop_at_the_deadline(clock, requests_mock):
     requests_mock.get(f"{BASE_URL}/shows/82", status_code=429)
 
-    with pytest.raises(Exception):
+    with pytest.raises(requests.HTTPError):
         get_show_with_episodes(82, deadline=clock.now + 1)
     assert len(requests_mock.request_history) == 1  # a 2s backoff wouldn't fit
 
@@ -256,3 +271,101 @@ def test_show_cache_evicts_oldest_entries_when_full(clock):
 )
 def test_network_name(show, expected):
     assert tvmaze_client.network_name(show) == expected
+
+
+def test_rate_limiter_paces_concurrent_callers(monkeypatch):
+    # Production calls come from a thread pool, so check the real thing:
+    # many threads, real clock, and no window ever over the limit.
+    monkeypatch.setattr(tvmaze_client, "time", time)
+    limiter = tvmaze_client._RateLimiter(calls=3, window=0.3)
+    stamps, lock = [], threading.Lock()
+
+    def take(_):
+        limiter.acquire(deadline=time.monotonic() + 5)
+        with lock:
+            stamps.append(time.monotonic())
+
+    with ThreadPoolExecutor(max_workers=9) as pool:
+        list(pool.map(take, range(9)))
+
+    stamps.sort()
+    assert stamps[-1] - stamps[0] >= 0.55  # 9 calls at 3 per 0.3s: two full waits
+    assert all(stamps[i + 3] - stamps[i] >= 0.25 for i in range(len(stamps) - 3))
+
+
+def test_concurrent_lookups_of_one_show_share_a_single_request(requests_mock):
+    def slow_response(request, context):
+        time.sleep(0.2)
+        return {"id": 82, "name": "Fringe"}
+
+    requests_mock.get(f"{BASE_URL}/shows/82", json=slow_response)
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        results = list(pool.map(lambda _: get_show_with_episodes(82), range(5)))
+
+    assert len(requests_mock.request_history) == 1
+    assert all(result == results[0] for result in results)
+
+
+def test_a_shared_lookup_that_ran_out_of_time_is_retried_within_the_waiters_budget(monkeypatch):
+    # A search (short budget) and the calendar (long budget) can want the
+    # same show at once. The search giving up mustn't fail the calendar.
+    calls, release = [], threading.Event()
+
+    def fake_fetch(show_id, deadline):
+        calls.append(show_id)
+        if len(calls) == 1:
+            release.wait(2)
+            raise TVMazeBusy("the first caller's budget ran out")
+        return {"id": show_id}, []
+
+    monkeypatch.setattr(tvmaze_client, "_fetch_show_with_episodes", fake_fetch)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        impatient = pool.submit(get_show_with_episodes, 82, deadline=time.monotonic() + 0.1)
+        while 82 not in tvmaze_client._in_flight:
+            time.sleep(0.01)
+        patient = pool.submit(get_show_with_episodes, 82, deadline=time.monotonic() + 30)
+        time.sleep(0.05)
+        release.set()
+
+        with pytest.raises(TVMazeBusy):
+            impatient.result()
+        assert patient.result() == ({"id": 82}, [])
+    assert len(calls) == 2
+
+
+def test_lookups_keep_only_recent_and_upcoming_episodes(requests_mock):
+    now = datetime.now(timezone.utc)
+
+    def ep(ep_id, days):
+        return {"id": ep_id, "airstamp": (now + timedelta(days=days)).isoformat()}
+
+    requests_mock.get(
+        f"{BASE_URL}/shows/82",
+        json={
+            "id": 82,
+            "_embedded": {
+                "episodes": [
+                    ep(1, -(EPISODE_HISTORY_DAYS + 1)),  # too old for the calendar
+                    ep(2, -1),
+                    ep(3, 7),
+                    {"id": 4, "airstamp": None},  # unscheduled
+                ]
+            },
+        },
+    )
+
+    _, episodes = get_show_with_episodes(82)
+
+    assert [episode["id"] for episode in episodes] == [2, 3]
+
+
+def test_upcoming_episodes_gives_the_release_date_when_there_is_no_air_time():
+    # The UI shows this date as-is, like the calendar's all-day event, instead
+    # of converting a placeholder airstamp to local time (maybe the wrong day).
+    streaming = {"airstamp": "2026-10-28T12:00:00+00:00", "airdate": "2026-10-28", "airtime": ""}
+    broadcast = {**streaming, "airtime": "21:00"}
+
+    assert upcoming_episodes([streaming], NOW)[0]["airdate"] == "2026-10-28"
+    assert upcoming_episodes([broadcast], NOW)[0]["airdate"] is None

@@ -95,8 +95,8 @@ GET /shows/search?q=traitors
     "image": "https://static.tvmaze.com/uploads/images/medium_portrait/...jpg",
     "summary": "<p>...</p>",
     "next_episodes": [
-      {"airstamp": "2026-10-30T01:00:00+00:00", "season": 4, "number": 2},
-      {"airstamp": "2026-11-06T01:00:00+00:00", "season": 4, "number": 3}
+      {"airstamp": "2026-10-30T01:00:00+00:00", "airdate": null, "season": 4, "number": 2},
+      {"airstamp": "2026-11-06T01:00:00+00:00", "airdate": null, "season": 4, "number": 3}
     ]
   }
 ]
@@ -106,9 +106,15 @@ TVMaze's search doesn't include episodes, so `next_episodes` costs one
 extra TVMaze request per result. Those requests run concurrently, and only
 for shows TVMaze reports as having a next episode scheduled, which skips
 ended shows. `next_episodes` is `[]` when nothing is scheduled and `null`
-when the lookup failed (or didn't get a TVMaze request slot within a few
-seconds -- see **TVMaze rate limits** below). A failed lookup only blanks
-that one show's airdates; the search itself still succeeds.
+when the lookup failed or didn't finish within a few seconds (see **TVMaze
+rate limits** below). A failed lookup only blanks that one show's airdates;
+the search itself still succeeds.
+
+`airdate` (`YYYY-MM-DD`) is set only for an episode with no announced air
+time, typical of streaming releases. Its `airstamp` hour is then a
+placeholder, so show `airdate` as-is rather than converting `airstamp` to
+local time, which can land on the wrong day. The calendar uses the same
+date for its all-day event.
 
 ### `GET /watchlist`
 
@@ -165,9 +171,9 @@ and its location is the network or streaming service. An episode TVMaze has
 no air *time* for (typical of streaming releases) is an all-day event on
 its release date instead, since its hour would be a placeholder. Episodes
 that aired more than 30 days ago are left out, so adding a long-running show
-doesn't fill the calendar with years of history. The calendar is named
-`TV Cal (<username>)`, so two people's feeds are told apart in one calendar
-app.
+doesn't fill the calendar with years of history. Since calendar apps delete
+events that drop out of a feed, that also means episodes disappear from
+your calendar about a month after they air.
 
 A show that TVMaze no longer knows about (deleted or renumbered ID) is
 skipped and logged — one dead ID shouldn't take down the rest of the feed.
@@ -181,11 +187,23 @@ silently wipe or flap the subscriber's episodes.
 
 TVMaze allows at least 20 requests per 10 seconds per IP. The calendar feed,
 search, and watchlist airdates all fan out one request per show, so the
-client paces its requests to stay just under that limit, retries a 429
-with backoff, and caches each show's data for an hour (per Function
-instance). A big watchlist's first calendar fetch therefore takes longer
-(about 5 seconds per 10 uncached shows) rather than failing; later fetches
-mostly come from the cache.
+client:
+- paces its requests to stay just under that limit,
+- retries a 429 with backoff,
+- shares one request between concurrent lookups of the same show, and
+- caches each show's recent and upcoming episodes for an hour.
+
+The cache is per Function instance, and idle instances are recycled, so it
+mostly helps bursts (refining a search, browsing the watchlist), not
+calendar polls hours apart. A cold calendar fetch for a big watchlist is
+slower (about 5 seconds per 10 shows) rather than failing.
+
+Each request has a total time budget for its lookups, covering both the
+rate-limit wait and the download: 5 seconds for search, 20 for the
+watchlist's airdates, and 150 for the calendar. Search and watchlist
+lookups still running at the deadline show no airdate (and finish in the
+background, warming the cache). The calendar answers `502` instead, for the
+same reason it never serves a partial feed.
 
 ## Running locally
 

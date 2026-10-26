@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 
 import azure.functions as func
 
@@ -258,7 +260,6 @@ def test_calendar_feed_does_not_require_a_session(monkeypatch):
     monkeypatch.setattr(auth, "is_authenticated", lambda req: False)
     monkeypatch.setattr(storage, "resolve_feed_token", lambda token: "abc123")
     monkeypatch.setattr(storage, "list_shows", lambda token: [])
-    _no_accounts(monkeypatch)
 
     response = function_app.calendar_feed(_request("GET", "calendar.ics", params={"feed": "tok"}))
 
@@ -404,7 +405,7 @@ def test_calendar_feed_rejects_unknown_feed_token(monkeypatch):
     assert response.status_code == 404
 
 
-# Airs in the future: the feed drops episodes older than CALENDAR_HISTORY_DAYS.
+# Airs in the future: the feed drops episodes older than EPISODE_HISTORY_DAYS.
 _PILOT_EPISODE = {
     "id": 1,
     "name": "Pilot",
@@ -422,15 +423,7 @@ def _use_feed_token(monkeypatch, feed_token="feed-tok", write_token="abc123"):
         return write_token
 
     monkeypatch.setattr(storage, "resolve_feed_token", fake_resolve_feed_token)
-    _no_accounts(monkeypatch)
     return feed_token
-
-
-def _no_accounts(monkeypatch):
-    def raise_unknown(username):
-        raise storage.UnknownAccount(username)
-
-    monkeypatch.setattr(storage, "get_account", raise_unknown)
 
 
 def test_calendar_feed_builds_events_from_feed_token(monkeypatch):
@@ -634,7 +627,7 @@ def test_search_includes_next_episodes_for_shows_with_one_scheduled(monkeypatch)
 
     results = _search_body(function_app.search(_request("GET", "shows/search", params={"q": "fringe"})))
 
-    assert results[82]["next_episodes"] == [{"airstamp": _FUTURE, "season": 6, "number": 1}]
+    assert results[82]["next_episodes"] == [{"airstamp": _FUTURE, "airdate": None, "season": 6, "number": 1}]
 
 
 def test_search_skips_the_episode_fetch_when_nothing_is_scheduled(monkeypatch):
@@ -675,7 +668,7 @@ def test_search_still_succeeds_when_an_episode_lookup_fails(monkeypatch):
 
     results = _search_body(function_app.search(_request("GET", "shows/search", params={"q": "x"})))
 
-    assert results[82]["next_episodes"] == [{"airstamp": _FUTURE, "season": 1, "number": 2}]
+    assert results[82]["next_episodes"] == [{"airstamp": _FUTURE, "airdate": None, "season": 1, "number": 2}]
     assert results[143]["next_episodes"] is None
 
 
@@ -729,7 +722,7 @@ def test_watchlist_upcoming_reports_each_shows_next_episodes(monkeypatch):
     assert response.status_code == 200
     assert json.loads(response.get_body()) == [
         {"id": 82, "status": "Ended", "next_episodes": []},
-        {"id": 143, "status": "Running", "next_episodes": [{"airstamp": _FUTURE, "season": 3, "number": 1}]},
+        {"id": 143, "status": "Running", "next_episodes": [{"airstamp": _FUTURE, "airdate": None, "season": 3, "number": 1}]},
     ]
 
 
@@ -746,19 +739,77 @@ def test_watchlist_upcoming_reports_a_failed_lookup_as_unknown(monkeypatch):
     assert json.loads(response.get_body()) == [{"id": 82, "status": None, "next_episodes": None}]
 
 
-def test_watchlist_upcoming_lookups_get_a_bounded_wait(monkeypatch):
-    monkeypatch.setattr(storage, "list_shows", lambda token: [{"id": 82, "name": "Fringe"}])
-    deadlines = []
+def _hanging_lookup(slow_show_id, release):
+    """A get_show_with_episodes fake where one show hangs until `release`."""
 
-    def record_deadline(show_id, deadline=None):
-        deadlines.append(deadline)
-        return {"id": 82}, []
+    def lookup(show_id, deadline=None):
+        if show_id == slow_show_id:
+            release.wait(5)
+        return {"id": show_id, "name": str(show_id), "status": "Running"}, [
+            {"airstamp": _FUTURE, "season": 1, "number": 1}
+        ]
 
-    monkeypatch.setattr(function_app, "get_show_with_episodes", record_deadline)
+    return lookup
 
-    function_app.watchlist_upcoming(_request("GET", "watchlist/upcoming"))
 
-    assert deadlines and deadlines[0] is not None
+def test_search_answers_within_its_budget_even_if_a_lookup_hangs(monkeypatch):
+    # The budget has to bound the whole wait, not just rate-limit waits: a
+    # slow TVMaze download used to hold up the entire search.
+    release = threading.Event()
+    monkeypatch.setattr(function_app, "SEARCH_LOOKUP_WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(
+        function_app, "search_shows", lambda q: [_tvmaze_show(82, "Fringe"), _tvmaze_show(143, "Slow")]
+    )
+    monkeypatch.setattr(function_app, "get_show_with_episodes", _hanging_lookup(143, release))
+    try:
+        started = time.monotonic()
+        results = _search_body(function_app.search(_request("GET", "shows/search", params={"q": "x"})))
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+
+    assert elapsed < 1
+    assert results[82]["next_episodes"]  # the prompt one still has its airdates
+    assert results[143]["next_episodes"] is None
+
+
+def test_watchlist_upcoming_answers_within_its_budget_even_if_a_lookup_hangs(monkeypatch):
+    release = threading.Event()
+    monkeypatch.setattr(function_app, "WATCHLIST_LOOKUP_WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(
+        storage, "list_shows", lambda token: [{"id": 82, "name": "Fringe"}, {"id": 143, "name": "Slow"}]
+    )
+    monkeypatch.setattr(function_app, "get_show_with_episodes", _hanging_lookup(143, release))
+    try:
+        started = time.monotonic()
+        response = function_app.watchlist_upcoming(_request("GET", "watchlist/upcoming"))
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+
+    body = {show["id"]: show for show in json.loads(response.get_body())}
+    assert elapsed < 1
+    assert body[82]["next_episodes"]
+    assert body[143] == {"id": 143, "status": None, "next_episodes": None}
+
+
+def test_calendar_feed_refuses_a_partial_feed_when_a_lookup_runs_out_of_time(monkeypatch):
+    release = threading.Event()
+    feed_token = _use_feed_token(monkeypatch)
+    monkeypatch.setattr(function_app, "CALENDAR_LOOKUP_WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(
+        storage, "list_shows", lambda token: [{"id": 82, "name": "Fringe"}, {"id": 143, "name": "Slow"}]
+    )
+    monkeypatch.setattr(function_app, "get_show_with_episodes", _hanging_lookup(143, release))
+    try:
+        started = time.monotonic()
+        response = function_app.calendar_feed(_request("GET", "calendar.ics", params={"feed": feed_token}))
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+
+    assert elapsed < 1
+    assert response.status_code == 502
 
 
 # -- calendar link reset -----------------------------------------------------
@@ -793,14 +844,16 @@ def test_new_routes_return_401_without_a_session(monkeypatch):
 # -- calendar name -----------------------------------------------------------
 
 
-def test_calendar_feed_is_named_after_its_account(monkeypatch):
+def test_calendar_feed_name_does_not_reveal_the_username(monkeypatch):
+    # A feed link is meant to be safe to leak (read-only, no login). Naming
+    # the calendar after the account would hand out half the login with it.
     feed_token = _use_feed_token(monkeypatch, write_token="alice")
-    monkeypatch.setattr(storage, "get_account", lambda username: {"username": username})
     monkeypatch.setattr(storage, "list_shows", lambda token: [])
 
-    response = function_app.calendar_feed(_request("GET", "calendar.ics", params={"feed": feed_token}))
+    body = function_app.calendar_feed(_request("GET", "calendar.ics", params={"feed": feed_token})).get_body()
 
-    assert b"X-WR-CALNAME:TV Cal (alice)" in response.get_body()
+    assert b"X-WR-CALNAME:TV Cal\r\n" in body
+    assert b"alice" not in body
 
 
 def test_calendar_feed_drops_long_past_episodes(monkeypatch):

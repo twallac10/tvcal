@@ -254,3 +254,28 @@ def test_reset_feed_token_works_before_any_token_exists(fake_client):
 
     assert storage.resolve_feed_token(new) == "abc123"
     assert storage.get_or_create_feed_token("abc123") == new
+
+
+def test_concurrent_resets_leave_no_token_that_cant_be_revoked(fake_client, monkeypatch):
+    # Two tabs resetting at once: without a conditional write both "win",
+    # and the overwritten tab's token keeps working with nothing pointing at
+    # it for a later reset to revoke.
+    storage.get_or_create_feed_token("alice")
+    real_get_entity = fake_client.get_entity
+    other_tab = {}
+
+    def get_entity_then_race(partition_key, row_key):
+        entity = real_get_entity(partition_key, row_key)
+        if row_key == "__meta__" and "token" not in other_tab:
+            other_tab["token"] = None  # don't race again from inside the race
+            other_tab["token"] = storage.reset_feed_token("alice")
+        return entity
+
+    monkeypatch.setattr(fake_client, "get_entity", get_entity_then_race)
+    this_tab = storage.reset_feed_token("alice")
+    monkeypatch.setattr(fake_client, "get_entity", real_get_entity)
+
+    current = storage.get_or_create_feed_token("alice")
+    assert this_tab == other_tab["token"] == current
+    resolvable = {row_key for (partition, row_key) in fake_client.rows if partition == "__feed_index__"}
+    assert resolvable == {current}

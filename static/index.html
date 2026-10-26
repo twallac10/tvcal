@@ -266,17 +266,18 @@
 <div id="toast" role="status" aria-live="polite" hidden></div>
 
 <script>
-  // searchSeq lets a slow search response notice it's been superseded (by
-  // a newer search, or by going home) and drop itself instead of
-  // overwriting what's on screen. upcomingSeq does the same for the
-  // watchlist's airdates.
+  // The *Seq counters let a slow response notice it's been superseded (by
+  // a newer request, going home, or signing out) and drop itself instead
+  // of overwriting what's on screen -- possibly with another account's data.
   const state = {
     username: null,
     feedToken: null,
     watchlist: [],
     upcoming: {},
     searchSeq: 0,
+    watchlistSeq: 0,
     upcomingSeq: 0,
+    feedTokenSeq: 0,
   };
 
   const OFFLINE_MESSAGE = "Couldn't reach TV Cal. Check your connection and try again.";
@@ -337,7 +338,9 @@
     state.feedToken = null;
     state.watchlist = [];
     state.upcoming = {};
+    state.watchlistSeq++;
     state.upcomingSeq++;
+    state.feedTokenSeq++;
     showHomeView();
     // Likewise their search: showApp() restores results from history, so
     // the next person to sign in on this tab would land on it.
@@ -438,9 +441,13 @@
   }
 
   async function loadWatchlist() {
+    const seq = ++state.watchlistSeq;
     const res = await apiFetch("/watchlist");
+    if (seq !== state.watchlistSeq) return;
     if (res.ok) {
-      state.watchlist = await res.json();
+      const watchlist = await res.json();
+      if (seq !== state.watchlistSeq) return;
+      state.watchlist = watchlist;
       loadUpcoming(); // not awaited: airdates fill in when TVMaze answers
     } else if (res.status !== 401) {
       notify(await errorMessage(res, "Couldn't load your watchlist."));
@@ -466,9 +473,13 @@
   }
 
   async function loadFeedToken() {
+    const seq = ++state.feedTokenSeq;
     const res = await apiFetch("/watchlist/feed-token");
+    if (seq !== state.feedTokenSeq) return;
     if (res.ok) {
-      state.feedToken = (await res.json()).feed_token;
+      const feedToken = (await res.json()).feed_token;
+      if (seq !== state.feedTokenSeq) return;
+      state.feedToken = feedToken;
     }
     renderFeedUrl();
   }
@@ -604,8 +615,17 @@
     }
   }
 
-  function formatAirdate(airstamp) {
-    const date = new Date(airstamp);
+  // An episode with no announced time comes with its release `airdate`
+  // (YYYY-MM-DD), shown as-is -- the airstamp's hour is a placeholder, and
+  // converting it to local time could land on the wrong day.
+  function formatAirdate(episode) {
+    let date;
+    if (episode.airdate) {
+      const [year, month, day] = episode.airdate.split("-").map(Number);
+      date = new Date(year, month - 1, day); // local midnight on that date
+    } else {
+      date = new Date(episode.airstamp);
+    }
     const options = { weekday: "short", month: "short", day: "numeric" };
     if (date.getFullYear() !== new Date().getFullYear()) {
       options.year = "numeric";
@@ -635,7 +655,7 @@
     const nbsp = (text) => text.replace(/ /g, " ");
     return episodes.map((episode, index) => {
       const code = formatEpisodeCode(episode);
-      const date = `${index === 0 ? "Next:" : "Then:"} ${nbsp(formatAirdate(episode.airstamp))}`;
+      const date = `${index === 0 ? "Next:" : "Then:"} ${nbsp(formatAirdate(episode))}`;
       return { text: code ? `${date} · ${code}` : date, upcoming: true };
     });
   }
@@ -781,8 +801,10 @@
 
     const btn = document.getElementById("reset-feed-btn");
     btn.disabled = true;
+    const seq = ++state.feedTokenSeq; // an older token load must not undo this
     const res = await apiFetch("/watchlist/feed-token/reset", { method: "POST" });
     btn.disabled = false;
+    if (seq !== state.feedTokenSeq) return;
     if (res.ok) {
       state.feedToken = (await res.json()).feed_token;
       renderFeedUrl();

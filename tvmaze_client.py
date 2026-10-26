@@ -4,7 +4,7 @@ from __future__ import annotations
 import collections
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -31,6 +31,11 @@ DEFAULT_WAIT_SECONDS = 30.0
 # calendar polls.
 _CACHE_TTL_SECONDS = 60 * 60
 _CACHE_MAX_ENTRIES = 500
+
+# get_show_with_episodes() keeps only episodes from this many days ago
+# onward. The calendar shows nothing older, and dropping the rest keeps a
+# cached daily show (thousands of episodes) small.
+EPISODE_HISTORY_DAYS = 30
 
 
 class TVMazeError(Exception):
@@ -92,8 +97,19 @@ class _ShowCache:
             self._entries[show_id] = (now + self._ttl, value)
 
 
+class _InFlight:
+    """One in-progress fetch that concurrent callers for the same show share."""
+
+    def __init__(self):
+        self.done = threading.Event()
+        self.result = None
+        self.error = None
+
+
 _limiter = _RateLimiter(_RATE_LIMIT_CALLS, _RATE_LIMIT_WINDOW_SECONDS)
 _cache = _ShowCache(_CACHE_TTL_SECONDS, _CACHE_MAX_ENTRIES)
+_in_flight: dict[int, _InFlight] = {}
+_in_flight_lock = threading.Lock()
 
 
 def _retry_delay(response: requests.Response) -> float:
@@ -130,22 +146,64 @@ def search_shows(query: str) -> list[dict]:
 
 
 def get_show_with_episodes(show_id: int, deadline: float | None = None) -> tuple[dict, list[dict]]:
-    """Fetch a show and its full episode list in a single TVMaze request.
+    """Fetch a show and its recent and upcoming episodes (see
+    EPISODE_HISTORY_DAYS) in a single TVMaze request.
 
     Results are cached for an hour and shared between callers, so treat
-    them as read-only.
+    them as read-only. Concurrent calls for the same show share one
+    request rather than each spending a rate-limit slot on it.
     """
-    cached = _cache.get(show_id)
-    if cached is not None:
-        return cached
+    if deadline is None:
+        deadline = time.monotonic() + DEFAULT_WAIT_SECONDS
+    while True:
+        cached = _cache.get(show_id)
+        if cached is not None:
+            return cached
+
+        with _in_flight_lock:
+            call = _in_flight.get(show_id)
+            leading = call is None
+            if leading:
+                call = _in_flight[show_id] = _InFlight()
+
+        if leading:
+            try:
+                call.result = _fetch_show_with_episodes(show_id, deadline)
+                _cache.put(show_id, call.result)
+                return call.result
+            except BaseException as exc:
+                call.error = exc
+                raise
+            finally:
+                with _in_flight_lock:
+                    del _in_flight[show_id]
+                call.done.set()
+
+        if not call.done.wait(timeout=max(0.0, deadline - time.monotonic())):
+            raise TVMazeBusy(f"Timed out waiting for TVMaze show {show_id}.")
+        if isinstance(call.error, TVMazeBusy):
+            continue  # it ran out of *its* caller's time budget; try within ours
+        if call.error is not None:
+            raise call.error
+        return call.result
+
+
+def _fetch_show_with_episodes(show_id: int, deadline: float) -> tuple[dict, list[dict]]:
     response = _get(f"/shows/{show_id}", params={"embed": "episodes"}, deadline=deadline)
     if response.status_code == 404:
         raise TVMazeError(f"No TVMaze show with id {show_id}")
     response.raise_for_status()
     show = response.json()
     episodes = show.pop("_embedded", {}).get("episodes", [])
-    _cache.put(show_id, (show, episodes))
-    return show, episodes
+    if not isinstance(episodes, list):
+        return show, episodes  # malformed; callers skip it
+    since = datetime.now(timezone.utc) - timedelta(days=EPISODE_HISTORY_DAYS)
+    recent = []
+    for episode in episodes:
+        airs_at = _airs_at(episode)
+        if airs_at is not None and airs_at >= since:
+            recent.append(episode)
+    return show, recent
 
 
 def network_name(show: dict) -> str | None:
@@ -161,6 +219,26 @@ def _int_or_none(value) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def _airs_at(episode) -> datetime | None:
+    """An episode's airstamp as an aware datetime (naive means UTC), or None
+    if it's missing or malformed -- TVMaze data is untrusted input."""
+    if not isinstance(episode, dict) or not isinstance(episode.get("airstamp"), str):
+        return None
+    try:
+        airs_at = datetime.fromisoformat(episode["airstamp"])
+    except ValueError:
+        return None
+    return airs_at if airs_at.tzinfo is not None else airs_at.replace(tzinfo=timezone.utc)
+
+
+def is_all_day(episode: dict) -> bool:
+    """True when TVMaze has a release date but no announced time -- typical
+    of streaming drops. The airstamp's hour is then a placeholder, so show
+    the date alone."""
+    airdate = episode.get("airdate")
+    return not episode.get("airtime") and isinstance(airdate, str) and bool(airdate)
+
+
 def upcoming_episodes(episodes, now: datetime, limit: int = 2) -> list[dict]:
     """The next `limit` episodes airing after `now`, soonest first.
 
@@ -174,21 +252,18 @@ def upcoming_episodes(episodes, now: datetime, limit: int = 2) -> list[dict]:
 
     upcoming = []
     for episode in episodes:
-        if not isinstance(episode, dict) or not isinstance(episode.get("airstamp"), str):
-            continue
-        try:
-            airs_at = datetime.fromisoformat(episode["airstamp"])
-        except ValueError:
-            continue
-        if airs_at.tzinfo is None:
-            airs_at = airs_at.replace(tzinfo=timezone.utc)
-        if airs_at > now:
+        airs_at = _airs_at(episode)
+        if airs_at is not None and airs_at > now:
             upcoming.append((airs_at, episode))
 
     upcoming.sort(key=lambda pair: pair[0])
     return [
         {
             "airstamp": airs_at.isoformat(),
+            # For an all-day episode, the UI shows `airdate` as-is rather
+            # than converting the placeholder airstamp to local time, which
+            # could land on a different day -- the same date the calendar uses.
+            "airdate": episode["airdate"] if is_all_day(episode) else None,
             "season": _int_or_none(episode.get("season")),
             "number": _int_or_none(episode.get("number")),
         }

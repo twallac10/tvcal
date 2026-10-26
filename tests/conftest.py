@@ -1,7 +1,10 @@
 import re
 
 import pytest
-from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
+import itertools
+
+from azure.core import MatchConditions
+from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
 
 import auth
 import storage
@@ -29,6 +32,7 @@ def fresh_tvmaze_state(monkeypatch):
         "_cache",
         tvmaze_client._ShowCache(tvmaze_client._CACHE_TTL_SECONDS, tvmaze_client._CACHE_MAX_ENTRIES),
     )
+    monkeypatch.setattr(tvmaze_client, "_in_flight", {})
     monkeypatch.setattr(
         tvmaze_client,
         "_limiter",
@@ -38,20 +42,41 @@ def fresh_tvmaze_state(monkeypatch):
     )
 
 
+class FakeEntity(dict):
+    """A dict with TableEntity's .metadata (just the etag)."""
+
+    def __init__(self, data, etag):
+        super().__init__(data)
+        self.metadata = {"etag": etag}
+
+
 class FakeTableClient:
     """In-memory stand-in for azure.data.tables.TableClient."""
 
     def __init__(self):
         self.rows: dict[tuple[str, str], dict] = {}
+        self._etags = itertools.count(1)
+
+    def _store(self, entity):
+        key = (entity["PartitionKey"], entity["RowKey"])
+        self.rows[key] = FakeEntity(entity, f"etag-{next(self._etags)}")
 
     def upsert_entity(self, entity):
-        self.rows[(entity["PartitionKey"], entity["RowKey"])] = entity
+        self._store(entity)
 
     def create_entity(self, entity):
         key = (entity["PartitionKey"], entity["RowKey"])
         if key in self.rows:
             raise ResourceExistsError("already exists")
-        self.rows[key] = entity
+        self._store(entity)
+
+    def update_entity(self, entity, mode=None, *, etag=None, match_condition=None):
+        key = (entity["PartitionKey"], entity["RowKey"])
+        if key not in self.rows:
+            raise ResourceNotFoundError("not found")
+        if match_condition == MatchConditions.IfNotModified and etag != self.rows[key].metadata["etag"]:
+            raise ResourceModifiedError("etag mismatch")
+        self._store(entity)
 
     def get_entity(self, partition_key, row_key):
         key = (partition_key, row_key)
