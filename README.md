@@ -26,9 +26,17 @@ A session cookie (HttpOnly, 30 days) keeps you signed in after that, with a
 "Log out" button to end it early.
 
 **Changing a password** ("Change password" at the bottom of the home page)
-signs that account out on every other device. A session only stays valid
-while its account exists and its password hasn't changed since it began, so
-it costs one account read per request.
+signs that account out on every other device. Each session is bound to the
+exact password it was signed in with, through a keyed fingerprint of the
+password hash in the cookie, so it stops working once that password changes.
+It also stops working if the account is deleted, even if the same username
+signs up again later. Checking this costs one account read per request. A
+password change also only lands if the account is unchanged since its
+current password was checked, so two changes at once can't overwrite each
+other.
+
+Changing a password doesn't change the calendar link. If someone else might
+have that too, use "Reset calendar link" as well.
 
 **Forgotten passwords**: accounts have no email address, so there's no
 self-service reset. Whoever runs the app resets it from their own machine
@@ -332,11 +340,14 @@ installed (`pip install -r requirements.txt`). It prompts for the new
 password, and signs that account out everywhere:
 
 ```bash
-export AzureWebJobsStorage="$(az functionapp config appsettings list \
+AzureWebJobsStorage="$(az functionapp config appsettings list \
   --name <function-app-name> --resource-group <resource-group> \
-  --query "[?name=='AzureWebJobsStorage'].value" -o tsv)"
-python scripts/reset_password.py <username>
+  --query "[?name=='AzureWebJobsStorage'].value" -o tsv)" \
+  python scripts/reset_password.py <username>
 ```
+
+The connection string is set for that one command only, so it doesn't stay
+in your shell.
 
 Tell them the new password, and have them change it under "Change
 password" once they're signed in. The script isn't deployed with the app

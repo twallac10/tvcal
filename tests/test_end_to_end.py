@@ -46,7 +46,8 @@ def _request(method, route, cookie=None, body=b"", route_params=None, params=Non
 
 def _cookie_for(username):
     """The Cookie request header a browser would send back after signing in."""
-    return auth.create_session_cookie(username).split(";")[0]
+    password_hash = storage.get_account(username)["password_hash"]
+    return auth.create_session_cookie(username, password_hash).split(";")[0]
 
 
 def _signup(username):
@@ -201,3 +202,76 @@ def test_changing_the_password_signs_out_every_other_device(fake_client):
 
     assert _login("alice", PASSWORD)[0] == 401
     assert _login("alice", "a-whole-new-password")[0] == 204
+
+
+
+def _change_password_request(cookie, current, new):
+    body = json.dumps({"current_password": current, "new_password": new}).encode()
+    return function_app.auth_change_password(
+        _request("POST", "auth/change-password", cookie=cookie, body=body)
+    )
+
+
+def _while_hashing(monkeypatch, action):
+    """Run `action` once, in the middle of the next password hash -- the
+    ~1s window a real login or password change spends in PBKDF2."""
+    real_hash = auth._hash_password
+    pending = [action]
+
+    def hash_with_interruption(*args):
+        if pending:
+            pending.pop()()
+        return real_hash(*args)
+
+    monkeypatch.setattr(auth, "_hash_password", hash_with_interruption)
+
+
+def _status(cookie):
+    return function_app.auth_status(_request("GET", "auth/status", cookie=cookie))
+
+
+def test_a_login_with_the_old_password_racing_a_change_gets_no_lasting_session(fake_client, monkeypatch):
+    # Someone who knows the old password keeps logging in. If one of those
+    # logins is mid-hash when the owner changes the password, it must not
+    # come out holding a session that's valid under the new one.
+    _signup("alice")
+    _, owner = _login("alice", PASSWORD)
+    _while_hashing(
+        monkeypatch,
+        lambda: _change_password_request(owner, PASSWORD, "owners-new-password"),
+    )
+
+    status, attacker = _login("alice", PASSWORD)  # checked against the old password
+
+    assert status == 204
+    assert json.loads(_status(attacker).get_body())["authenticated"] is False
+    assert _login("alice", "owners-new-password")[0] == 204
+
+
+def test_a_password_change_racing_another_cannot_overwrite_it(fake_client, monkeypatch):
+    # An attacker with a session and the old password tries to change it at
+    # the same moment the owner does: the owner's change must stand.
+    _signup("alice")
+    _, owner = _login("alice", PASSWORD)
+    _, attacker = _login("alice", PASSWORD)
+    owner_result = []
+    _while_hashing(
+        monkeypatch,
+        lambda: owner_result.append(_change_password_request(owner, PASSWORD, "owners-new-password")),
+    )
+
+    response = _change_password_request(attacker, PASSWORD, "attackers-password")
+
+    assert owner_result[0].status_code == 204
+    assert response.status_code == 409
+    assert _login("alice", "owners-new-password")[0] == 204
+    assert _login("alice", "attackers-password")[0] == 401
+
+
+def test_recreating_a_deleted_account_does_not_revive_its_sessions(fake_client):
+    _signup("bob")
+    _, old_cookie = _login("bob", PASSWORD)
+    fake_client.delete_entity("__accounts__", "bob")
+    _signup("bob")  # same name, same password
+
+    assert json.loads(_status(old_cookie).get_body())["authenticated"] is False

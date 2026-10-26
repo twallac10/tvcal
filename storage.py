@@ -76,8 +76,8 @@ class TooManyAccounts(Exception):
     """Raised once MAX_ACCOUNTS accounts already exist."""
 
 
-class AccountBusy(Exception):
-    """Raised when an account kept changing underneath a password update."""
+class AccountChanged(Exception):
+    """Raised when an account changed after the caller read it."""
 
 
 def validate_token(token: str) -> None:
@@ -286,40 +286,30 @@ def get_account(username: str) -> dict:
         "password_hash": entity["PasswordHash"],
         "salt": entity["Salt"],
         "iterations": entity["Iterations"],
-        # Accounts created before sessions were versioned have no
-        # SessionVersion yet; they start at 0.
-        "session_version": entity.get("SessionVersion", 0),
+        "etag": entity.metadata["etag"],
     }
 
 
-def set_password(username: str, password_hash: str, salt: str, iterations: int) -> None:
-    """Replace an account's password and bump its session version, which
-    signs out every existing session for it (see auth.py)."""
+def set_password(username: str, password_hash: str, salt: str, iterations: int, etag: str) -> None:
+    """Replace an account's password, if the account is unchanged since the
+    read that `etag` came from (see auth.change_password); raises
+    AccountChanged otherwise, rather than retrying past whatever changed."""
     validate_token(username)
     client = _table_client()
-    for _ in range(5):
-        try:
-            entity = client.get_entity(partition_key=_ACCOUNTS_PARTITION, row_key=username)
-        except ResourceNotFoundError:
-            raise UnknownAccount(f"No account for username '{username}'.")
-        try:
-            # Conditional on the row just read, so two changes at once both
-            # count: each bumps the version instead of one silently
-            # overwriting the other's bump.
-            client.update_entity(
-                {
-                    "PartitionKey": _ACCOUNTS_PARTITION,
-                    "RowKey": username,
-                    "PasswordHash": password_hash,
-                    "Salt": salt,
-                    "Iterations": iterations,
-                    "SessionVersion": entity.get("SessionVersion", 0) + 1,
-                },
-                mode=UpdateMode.REPLACE,
-                etag=entity.metadata["etag"],
-                match_condition=MatchConditions.IfNotModified,
-            )
-            return
-        except ResourceModifiedError:
-            continue
-    raise AccountBusy(f"Account '{username}' kept changing; try again.")
+    try:
+        client.update_entity(
+            {
+                "PartitionKey": _ACCOUNTS_PARTITION,
+                "RowKey": username,
+                "PasswordHash": password_hash,
+                "Salt": salt,
+                "Iterations": iterations,
+            },
+            mode=UpdateMode.REPLACE,
+            etag=etag,
+            match_condition=MatchConditions.IfNotModified,
+        )
+    except ResourceNotFoundError:
+        raise UnknownAccount(f"No account for username '{username}'.")
+    except ResourceModifiedError:
+        raise AccountChanged(f"Account '{username}' changed while this was in progress.")

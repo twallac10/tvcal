@@ -274,7 +274,7 @@
             <button type="submit">Change password</button>
           </form>
           <p id="password-error" class="error" hidden></p>
-          <p class="hint">This signs you out on your other devices.</p>
+          <p class="hint">This signs you out on your other devices. It doesn't change your calendar link: if someone else might have that too, use "Reset calendar link" above.</p>
         </details>
       </section>
     </div>
@@ -366,7 +366,9 @@
       history.replaceState(null, "");
     }
 
-    // Don't leave a half-typed password behind for whoever signs in next.
+    // Don't leave a half-typed password (or this account's name) behind for
+    // whoever signs in next.
+    document.getElementById("password-form-username").defaultValue = "";
     document.getElementById("password-form").reset();
     document.getElementById("password-error").hidden = true;
     document.getElementById("password-details").open = false;
@@ -384,7 +386,8 @@
     document.getElementById("signed-in-as").textContent = state.username
       ? `Signed in as ${state.username}`
       : "";
-    document.getElementById("password-form-username").value = state.username || "";
+    // defaultValue, not value, so the form's reset() after a change keeps it.
+    document.getElementById("password-form-username").defaultValue = state.username || "";
     loadWatchlist();
 
     // A reload (or re-login) while on a results page stays on it.

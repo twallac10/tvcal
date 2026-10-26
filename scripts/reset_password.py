@@ -6,12 +6,13 @@ Share the new password with them and have them change it in the app
 ("Change password", at the bottom of the home page).
 
 Needs the app's requirements installed (pip install -r requirements.txt)
-and the Function App's storage connection string:
+and the Function App's storage connection string, passed for just this one
+command so it doesn't linger in your shell:
 
-    export AzureWebJobsStorage="$(az functionapp config appsettings list \\
+    AzureWebJobsStorage="$(az functionapp config appsettings list \\
         --name <function-app-name> --resource-group <resource-group> \\
-        --query "[?name=='AzureWebJobsStorage'].value" -o tsv)"
-    python scripts/reset_password.py <username>
+        --query "[?name=='AzureWebJobsStorage'].value" -o tsv)" \\
+        python scripts/reset_password.py <username>
 """
 import getpass
 import os
@@ -38,7 +39,7 @@ def main(argv: list[str]) -> int:
 
     try:
         username = auth.validate_username(argv[1])
-        storage.get_account(username)
+        account = storage.get_account(username)
     except auth.InvalidUsername as exc:
         print(exc, file=sys.stderr)
         return 1
@@ -52,9 +53,16 @@ def main(argv: list[str]) -> int:
         return 1
 
     try:
-        auth.change_password(username, password)
-    except (auth.InvalidPassword, storage.AccountBusy) as exc:
+        auth.change_password(username, password, account["etag"])
+    except auth.InvalidPassword as exc:
         print(f"{exc} Nothing was changed.", file=sys.stderr)
+        return 1
+    except storage.AccountChanged:
+        print(
+            f"'{username}' changed their password just now, so nothing was changed. "
+            "Run this again if they still need a reset.",
+            file=sys.stderr,
+        )
         return 1
 
     print(f"Password for '{username}' changed, and they've been signed out everywhere.")

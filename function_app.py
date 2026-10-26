@@ -103,7 +103,7 @@ def auth_signup(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse("Invalid signup code.", status_code=401)
 
     try:
-        normalized_username = auth.create_account(username, password)
+        normalized_username, password_hash = auth.create_account(username, password)
     except auth.InvalidUsername as exc:
         return func.HttpResponse(str(exc), status_code=400)
     except storage.UsernameTaken as exc:
@@ -112,7 +112,7 @@ def auth_signup(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(str(exc), status_code=403)
 
     try:
-        cookie = auth.create_session_cookie(normalized_username)
+        cookie = auth.create_session_cookie(normalized_username, password_hash)
     except auth.AuthConfigError:
         logging.error("Signup succeeded but SESSION_SECRET is not configured.")
         return func.HttpResponse("Server auth is not configured.", status_code=500)
@@ -135,15 +135,15 @@ def auth_login(req: func.HttpRequest) -> func.HttpResponse:
         # Reject before hashing -- see auth.MAX_PASSWORD_LENGTH.
         return func.HttpResponse("Incorrect username or password.", status_code=401)
 
+    account = auth.check_login(username, password)
+    if account is None:
+        return func.HttpResponse("Incorrect username or password.", status_code=401)
     try:
-        valid = auth.verify_login(username, password)
-        cookie = auth.create_session_cookie(username.lower()) if valid else None
+        # Bound to the password just checked, not whatever is stored by now.
+        cookie = auth.create_session_cookie(account["username"], account["password_hash"])
     except auth.AuthConfigError:
         logging.error("Login attempted but auth app settings are not configured.")
         return func.HttpResponse("Server auth is not configured.", status_code=500)
-
-    if not valid:
-        return func.HttpResponse("Incorrect username or password.", status_code=401)
 
     return func.HttpResponse(status_code=204, headers={"Set-Cookie": cookie})
 
@@ -181,16 +181,22 @@ def auth_change_password(req: func.HttpRequest) -> func.HttpResponse:
     username = auth.get_username(req)
     # 403, not 401: the session itself is fine (the UI treats 401 as
     # "signed out"). Oversized input is refused before hashing, as at login.
-    if len(current_password) > auth.MAX_PASSWORD_LENGTH or not auth.verify_login(
-        username, current_password
-    ):
+    account = None
+    if len(current_password) <= auth.MAX_PASSWORD_LENGTH:
+        account = auth.check_login(username, current_password)
+    if account is None:
         return func.HttpResponse("Current password is incorrect.", status_code=403)
 
     try:
-        auth.change_password(username, new_password)
-    except storage.AccountBusy as exc:
-        return func.HttpResponse(str(exc), status_code=409)
-    return func.HttpResponse(status_code=204, headers={"Set-Cookie": auth.create_session_cookie(username)})
+        new_hash = auth.change_password(username, new_password, account["etag"])
+    except storage.AccountChanged:
+        return func.HttpResponse(
+            "Your password was just changed somewhere else, so nothing was changed here.",
+            status_code=409,
+        )
+    return func.HttpResponse(
+        status_code=204, headers={"Set-Cookie": auth.create_session_cookie(username, new_hash)}
+    )
 
 
 @app.route(route="auth/status", methods=["GET"])

@@ -28,9 +28,13 @@ def test_index_does_not_require_a_session():
 
 def test_auth_signup_creates_account_and_sets_cookie(monkeypatch):
     monkeypatch.setattr(auth, "check_signup_code", lambda code: code == "letmein")
-    monkeypatch.setattr(auth, "create_account", lambda username, password: username.lower())
     monkeypatch.setattr(
-        auth, "create_session_cookie", lambda username: f"tvcal_session={username}; Path=/"
+        auth, "create_account", lambda username, password: (username.lower(), "hash-just-written")
+    )
+    monkeypatch.setattr(
+        auth,
+        "create_session_cookie",
+        lambda username, password_hash: f"tvcal_session={username}+{password_hash}; Path=/",
     )
 
     body = json.dumps(
@@ -39,7 +43,7 @@ def test_auth_signup_creates_account_and_sets_cookie(monkeypatch):
     response = function_app.auth_signup(_request("POST", "auth/signup", body=body))
 
     assert response.status_code == 204
-    assert response.headers["Set-Cookie"] == "tvcal_session=alice; Path=/"
+    assert response.headers["Set-Cookie"] == "tvcal_session=alice+hash-just-written; Path=/"
 
 
 def test_auth_signup_rejects_wrong_signup_code(monkeypatch):
@@ -134,21 +138,29 @@ def test_auth_signup_returns_403_when_too_many_accounts(monkeypatch):
     assert response.status_code == 403
 
 
-def test_auth_login_sets_cookie_on_correct_credentials(monkeypatch):
-    monkeypatch.setattr(auth, "verify_login", lambda username, password: password == "right")
+def _checked_account(username="alice", password_hash="hash-that-was-checked"):
+    return {"username": username, "password_hash": password_hash, "etag": "etag-checked"}
+
+
+def test_auth_login_sets_cookie_bound_to_the_password_it_checked(monkeypatch):
     monkeypatch.setattr(
-        auth, "create_session_cookie", lambda username: f"tvcal_session={username}; Path=/"
+        auth, "check_login", lambda username, password: _checked_account() if password == "right" else None
+    )
+    monkeypatch.setattr(
+        auth,
+        "create_session_cookie",
+        lambda username, password_hash: f"tvcal_session={username}+{password_hash}; Path=/",
     )
 
     body = json.dumps({"username": "Alice", "password": "right"}).encode()
     response = function_app.auth_login(_request("POST", "auth/login", body=body))
 
     assert response.status_code == 204
-    assert response.headers["Set-Cookie"] == "tvcal_session=alice; Path=/"
+    assert response.headers["Set-Cookie"] == "tvcal_session=alice+hash-that-was-checked; Path=/"
 
 
 def test_auth_login_rejects_wrong_credentials(monkeypatch):
-    monkeypatch.setattr(auth, "verify_login", lambda username, password: False)
+    monkeypatch.setattr(auth, "check_login", lambda username, password: None)
 
     body = json.dumps({"username": "alice", "password": "wrong"}).encode()
     response = function_app.auth_login(_request("POST", "auth/login", body=body))
@@ -167,10 +179,11 @@ def test_auth_login_rejects_malformed_body():
 
 
 def test_auth_login_returns_500_when_server_auth_unconfigured(monkeypatch):
-    def raise_unconfigured(username, password):
+    def raise_unconfigured(username, password_hash):
         raise auth.AuthConfigError("nope")
 
-    monkeypatch.setattr(auth, "verify_login", raise_unconfigured)
+    monkeypatch.setattr(auth, "check_login", lambda username, password: _checked_account())
+    monkeypatch.setattr(auth, "create_session_cookie", raise_unconfigured)
 
     body = json.dumps({"username": "alice", "password": "whatever"}).encode()
     response = function_app.auth_login(_request("POST", "auth/login", body=body))
@@ -558,7 +571,7 @@ def test_auth_login_rejects_an_oversized_password_without_hashing(monkeypatch):
     def fail_if_called(username, password):
         raise AssertionError("should reject before hashing")
 
-    monkeypatch.setattr(auth, "verify_login", fail_if_called)
+    monkeypatch.setattr(auth, "check_login", fail_if_called)
 
     body = json.dumps({"username": "alice", "password": "a" * 100_000}).encode()
     response = function_app.auth_login(_request("POST", "auth/login", body=body))
@@ -901,35 +914,64 @@ def _change_password(current="old-password", new="a-new-password"):
     return function_app.auth_change_password(_request("POST", "auth/change-password", body=body))
 
 
-def test_change_password_sets_it_and_reissues_this_devices_session(monkeypatch):
+def test_change_password_writes_against_the_checked_account_and_reissues_this_session(monkeypatch):
     changed = []
-    monkeypatch.setattr(auth, "verify_login", lambda username, password: (username, password) == ("testuser", "old-password"))
-    monkeypatch.setattr(auth, "change_password", lambda username, new: changed.append((username, new)))
-    monkeypatch.setattr(auth, "create_session_cookie", lambda username: f"tvcal_session=fresh-{username}")
+    monkeypatch.setattr(
+        auth,
+        "check_login",
+        lambda username, password: _checked_account("testuser")
+        if (username, password) == ("testuser", "old-password")
+        else None,
+    )
+
+    def fake_change(username, new, etag):
+        changed.append((username, new, etag))
+        return "hash-just-written"
+
+    monkeypatch.setattr(auth, "change_password", fake_change)
+    monkeypatch.setattr(
+        auth, "create_session_cookie", lambda username, password_hash: f"tvcal_session={username}+{password_hash}"
+    )
 
     response = _change_password()
 
     assert response.status_code == 204
-    assert changed == [("testuser", "a-new-password")]
-    assert response.headers["Set-Cookie"] == "tvcal_session=fresh-testuser"
+    # Conditional on the row whose password was just checked...
+    assert changed == [("testuser", "a-new-password", "etag-checked")]
+    # ...and this device's new session bound to the password just written.
+    assert response.headers["Set-Cookie"] == "tvcal_session=testuser+hash-just-written"
+
+
+def test_change_password_reports_a_concurrent_change_instead_of_overwriting_it(monkeypatch):
+    monkeypatch.setattr(auth, "check_login", lambda username, password: _checked_account("testuser"))
+
+    def changed_meanwhile(username, new, etag):
+        raise storage.AccountChanged("changed")
+
+    monkeypatch.setattr(auth, "change_password", changed_meanwhile)
+
+    response = _change_password()
+
+    assert response.status_code == 409
+    assert "Set-Cookie" not in response.headers
 
 
 def test_change_password_refuses_a_wrong_current_password_with_403_not_401(monkeypatch):
     # 401 would make the UI think the session ended and show the login form.
-    monkeypatch.setattr(auth, "verify_login", lambda username, password: False)
+    monkeypatch.setattr(auth, "check_login", lambda username, password: None)
     monkeypatch.setattr(auth, "change_password", lambda *a: (_ for _ in ()).throw(AssertionError("changed")))
 
     assert _change_password(current="wrong").status_code == 403
 
 
 def test_change_password_checks_the_new_password_before_anything_else(monkeypatch):
-    monkeypatch.setattr(auth, "verify_login", lambda *a: (_ for _ in ()).throw(AssertionError("hashed")))
+    monkeypatch.setattr(auth, "check_login", lambda *a: (_ for _ in ()).throw(AssertionError("hashed")))
 
     assert _change_password(new="short").status_code == 400
 
 
 def test_change_password_rejects_an_oversized_current_password_without_hashing(monkeypatch):
-    monkeypatch.setattr(auth, "verify_login", lambda *a: (_ for _ in ()).throw(AssertionError("hashed")))
+    monkeypatch.setattr(auth, "check_login", lambda *a: (_ for _ in ()).throw(AssertionError("hashed")))
 
     assert _change_password(current="x" * 100_000).status_code == 403
 
