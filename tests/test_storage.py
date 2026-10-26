@@ -303,3 +303,22 @@ def test_reserved_tokens_are_rejected_everywhere(fake_client, reserved):
         storage.migrate_watchlist(reserved, "alice")
     with pytest.raises(storage.InvalidListToken):
         storage.migrate_watchlist("some-legacy-token", reserved)
+
+
+def test_reset_feed_token_revokes_the_old_link(fake_client):
+    old = storage.get_or_create_feed_token("abc123")
+
+    new = storage.reset_feed_token("abc123")
+
+    assert new != old
+    assert storage.resolve_feed_token(new) == "abc123"
+    assert storage.get_or_create_feed_token("abc123") == new
+    with pytest.raises(storage.UnknownFeedToken):
+        storage.resolve_feed_token(old)
+
+
+def test_reset_feed_token_works_before_any_token_exists(fake_client):
+    new = storage.reset_feed_token("abc123")
+
+    assert storage.resolve_feed_token(new) == "abc123"
+    assert storage.get_or_create_feed_token("abc123") == new

@@ -187,6 +187,30 @@ def get_or_create_feed_token(list_token: str) -> str:
     return feed_token
 
 
+def reset_feed_token(list_token: str) -> str:
+    """Replace a watchlist's feed token with a new one and revoke the old one,
+    so a leaked calendar link stops working. Returns the new token."""
+    validate_token(list_token)
+    client = _table_client()
+    try:
+        old_feed_token = client.get_entity(partition_key=list_token, row_key=_META_ROW_KEY)["FeedToken"]
+    except ResourceNotFoundError:
+        old_feed_token = None
+
+    feed_token = secrets.token_urlsafe(24)
+    # Same ordering as get_or_create_feed_token: index row before the meta
+    # row that hands the token out, so a failure in between can't leave a
+    # link that never resolves.
+    _ensure_feed_index(client, feed_token, list_token)
+    client.upsert_entity({"PartitionKey": list_token, "RowKey": _META_ROW_KEY, "FeedToken": feed_token})
+    if old_feed_token is not None:
+        try:
+            client.delete_entity(partition_key=_FEED_INDEX_PARTITION, row_key=old_feed_token)
+        except ResourceNotFoundError:
+            pass
+    return feed_token
+
+
 def resolve_feed_token(feed_token: str) -> str:
     """Return the write token (watchlist) that a feed token was issued for."""
     validate_token(feed_token)

@@ -56,7 +56,10 @@ username and password can add or remove shows.
 
 The calendar URL built from a feed token (`/calendar.ics?feed=<token>`)
 stays stable as you add or remove shows — subscribe once in your calendar
-app and it keeps updating.
+app and it keeps updating. The UI's "Add to Apple Calendar" / "Add to Google
+Calendar" buttons subscribe to it in one tap. If the link ever leaks, "Reset
+calendar link" revokes it and issues a new one (calendars on the old link
+stop updating and need re-subscribing).
 
 ## Endpoints
 
@@ -110,12 +113,23 @@ TVMaze's search doesn't include episodes, so `next_episodes` costs one
 extra TVMaze request per result. Those requests run concurrently, and only
 for shows TVMaze reports as having a next episode scheduled, which skips
 ended shows. `next_episodes` is `[]` when nothing is scheduled and `null`
-when the lookup failed. A failed lookup only blanks that one show's
-airdates; the search itself still succeeds.
+when the lookup failed (or didn't get a TVMaze request slot within a few
+seconds -- see **TVMaze rate limits** below). A failed lookup only blanks
+that one show's airdates; the search itself still succeeds.
 
 ### `GET /watchlist`
 
 Returns the shows on your watchlist: `[{"id": 82, "name": "Fringe"}, ...]`.
+
+### `GET /watchlist/upcoming`
+
+The next episodes for each show on your watchlist:
+`[{"id": 82, "status": "Ended", "next_episodes": []}, ...]`, with
+`next_episodes` shaped as in search. Separate from `GET /watchlist` because
+it costs a TVMaze lookup per show, so the UI renders the list first and
+fills airdates in when this answers. Best-effort per show: `status` and
+`next_episodes` are `null` when that show's lookup failed or ran past its
+time budget.
 
 ### `POST /watchlist`
 
@@ -132,6 +146,12 @@ Returns (creating on first call) the read-only feed token for your
 watchlist: `{"feed_token": "..."}`. Idempotent — repeat calls return the
 same token.
 
+### `POST /watchlist/feed-token/reset`
+
+Replaces your feed token with a new one and revokes the old one:
+`{"feed_token": "..."}`. Calendars subscribed with the old link stop
+updating.
+
 ### `GET /calendar.ics?feed=<feed_token>`
 
 Returns an `.ics` feed with one event per aired/upcoming episode on the
@@ -147,7 +167,14 @@ GET /calendar.ics?feed=RmVlZFRva2VuRXhhbXBsZQ
 ```
 
 Each event's summary is `<Show> - S01E01 - <Episode Title>`, timed at the
-episode's air date/time with a duration from the episode (or show) runtime.
+episode's air date/time with a duration from the episode (or show) runtime,
+and its location is the network or streaming service. An episode TVMaze has
+no air *time* for (typical of streaming releases) is an all-day event on
+its release date instead, since its hour would be a placeholder. Episodes
+that aired more than 30 days ago are left out, so adding a long-running show
+doesn't fill the calendar with years of history. The calendar is named
+`TV Cal (<username>)`, so two people's feeds are told apart in one calendar
+app.
 
 A show that TVMaze no longer knows about (deleted or renumbered ID) is
 skipped and logged — one dead ID shouldn't take down the rest of the feed.
@@ -156,6 +183,16 @@ different: the whole request returns `502` rather than a `200` missing
 those shows, because calendar apps treat a success as authoritative and
 delete every event absent from it — so serving a partial feed would
 silently wipe or flap the subscriber's episodes.
+
+### TVMaze rate limits
+
+TVMaze allows at least 20 requests per 10 seconds per IP. The calendar feed,
+search, and watchlist airdates all fan out one request per show, so the
+client paces its requests to stay just under that limit, retries a 429
+with backoff, and caches each show's data for an hour (per Function
+instance). A big watchlist's first calendar fetch therefore takes longer
+(about 5 seconds per 10 uncached shows) rather than failing; later fetches
+mostly come from the cache.
 
 ## Running locally
 

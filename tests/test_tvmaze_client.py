@@ -123,3 +123,136 @@ def test_upcoming_episodes_skips_malformed_data_instead_of_raising():
         {"airstamp": "2026-10-27T01:00:00+00:00", "season": None, "number": None}
     ]
     assert upcoming_episodes("not a list", NOW) == []
+
+
+# -- rate limiting and caching ---------------------------------------------
+
+
+class FakeClock:
+    """Stands in for time.monotonic/time.sleep: sleeping advances the clock."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.slept = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    fake = FakeClock()
+    monkeypatch.setattr(tvmaze_client.time, "monotonic", fake.monotonic)
+    monkeypatch.setattr(tvmaze_client.time, "sleep", fake.sleep)
+    return fake
+
+
+def test_rate_limiter_paces_requests_instead_of_bursting(clock):
+    limiter = tvmaze_client._RateLimiter(calls=3, window=10.0)
+
+    for _ in range(3):
+        limiter.acquire(deadline=clock.now + 30)
+    assert clock.slept == []
+
+    limiter.acquire(deadline=clock.now + 30)  # 4th must wait for the window
+    assert clock.slept == [10.0]
+
+
+def test_rate_limiter_gives_up_at_the_deadline(clock):
+    limiter = tvmaze_client._RateLimiter(calls=1, window=10.0)
+    limiter.acquire(deadline=clock.now + 30)
+
+    with pytest.raises(tvmaze_client.TVMazeBusy):
+        limiter.acquire(deadline=clock.now + 3)
+    assert clock.slept == []
+
+
+def test_a_watchlist_bigger_than_the_rate_limit_still_fetches_every_show(clock, requests_mock):
+    # 40 shows is more than TVMaze allows in one 10s window -- unpaced,
+    # this 429'd. Paced, it takes longer but every lookup succeeds.
+    for show_id in range(1, 41):
+        requests_mock.get(f"{BASE_URL}/shows/{show_id}", json={"id": show_id})
+
+    for show_id in range(1, 41):
+        get_show_with_episodes(show_id)
+
+    assert len(requests_mock.request_history) == 40
+    assert sum(clock.slept) >= 20  # 40 requests at 18 per 10s
+
+
+def test_rate_limited_request_is_retried_several_times(clock, requests_mock):
+    requests_mock.get(
+        f"{BASE_URL}/shows/82",
+        [{"status_code": 429}] * 3 + [{"json": {"id": 82, "name": "Fringe"}}],
+    )
+
+    show, _ = get_show_with_episodes(82)
+
+    assert show["name"] == "Fringe"
+    assert len(requests_mock.request_history) == 4
+
+
+def test_rate_limit_retries_stop_at_the_deadline(clock, requests_mock):
+    requests_mock.get(f"{BASE_URL}/shows/82", status_code=429)
+
+    with pytest.raises(Exception):
+        get_show_with_episodes(82, deadline=clock.now + 1)
+    assert len(requests_mock.request_history) == 1  # a 2s backoff wouldn't fit
+
+
+def test_show_lookups_are_cached(clock, requests_mock):
+    requests_mock.get(f"{BASE_URL}/shows/82", json={"id": 82, "name": "Fringe"})
+
+    first = get_show_with_episodes(82)
+    second = get_show_with_episodes(82)
+
+    assert first == second
+    assert len(requests_mock.request_history) == 1
+
+
+def test_cached_show_lookups_expire(clock, requests_mock):
+    requests_mock.get(f"{BASE_URL}/shows/82", json={"id": 82, "name": "Fringe"})
+
+    get_show_with_episodes(82)
+    clock.now += tvmaze_client._CACHE_TTL_SECONDS + 1
+    get_show_with_episodes(82)
+
+    assert len(requests_mock.request_history) == 2
+
+
+def test_missing_shows_are_not_cached(requests_mock):
+    requests_mock.get(f"{BASE_URL}/shows/82", status_code=404)
+
+    for _ in range(2):
+        with pytest.raises(TVMazeError):
+            get_show_with_episodes(82)
+    assert len(requests_mock.request_history) == 2
+
+
+def test_show_cache_evicts_oldest_entries_when_full(clock):
+    cache = tvmaze_client._ShowCache(ttl=3600, max_entries=2)
+    cache.put(1, "one")
+    cache.put(2, "two")
+    cache.put(3, "three")
+
+    assert cache.get(1) is None
+    assert cache.get(2) == "two"
+    assert cache.get(3) == "three"
+
+
+@pytest.mark.parametrize(
+    "show, expected",
+    [
+        ({"network": {"name": "FOX"}, "webChannel": None}, "FOX"),
+        ({"network": None, "webChannel": {"name": "Netflix"}}, "Netflix"),
+        ({"network": None, "webChannel": None}, None),
+        ({"network": "not a dict"}, None),
+        ({}, None),
+    ],
+)
+def test_network_name(show, expected):
+    assert tvmaze_client.network_name(show) == expected

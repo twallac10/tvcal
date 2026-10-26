@@ -238,3 +238,8 @@ def test_require_session_allows_authenticated(monkeypatch):
 
     assert result == "ok-marker"
     assert len(calls) == 1
+
+
+def test_a_cookie_with_a_non_ascii_signature_is_rejected_not_500ed():
+    req = _request_with_cookie("tvcal_session=alice.9999999999.é")
+    assert auth.get_username(req) is None

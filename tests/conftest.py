@@ -5,6 +5,7 @@ from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 
 import auth
 import storage
+import tvmaze_client
 
 
 @pytest.fixture(autouse=True)
@@ -16,6 +17,25 @@ def bypass_auth(monkeypatch):
     """
     monkeypatch.setattr(auth, "is_authenticated", lambda req: True)
     monkeypatch.setattr(auth, "get_username", lambda req: "testuser")
+
+
+@pytest.fixture(autouse=True)
+def fresh_tvmaze_state(monkeypatch):
+    """The TVMaze client's cache and rate limiter are process-wide, so give
+    each test its own -- otherwise one test's cached show (or spent request
+    slots) leaks into the next."""
+    monkeypatch.setattr(
+        tvmaze_client,
+        "_cache",
+        tvmaze_client._ShowCache(tvmaze_client._CACHE_TTL_SECONDS, tvmaze_client._CACHE_MAX_ENTRIES),
+    )
+    monkeypatch.setattr(
+        tvmaze_client,
+        "_limiter",
+        tvmaze_client._RateLimiter(
+            tvmaze_client._RATE_LIMIT_CALLS, tvmaze_client._RATE_LIMIT_WINDOW_SECONDS
+        ),
+    )
 
 
 class FakeTableClient:

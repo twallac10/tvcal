@@ -4,9 +4,11 @@ from __future__ import annotations
 import html
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from icalendar import Calendar, Event
+
+from tvmaze_client import network_name
 
 DEFAULT_RUNTIME_MINUTES = 30
 _HTML_TAG_RE = re.compile(r"<[^<]+?>")
@@ -17,11 +19,17 @@ def _safe_id(value) -> object:
     return value.get("id") if isinstance(value, dict) else None
 
 
-def build_calendar(shows_with_episodes: list[tuple[dict, list[dict]]]) -> Calendar:
+def build_calendar(
+    shows_with_episodes: list[tuple[dict, list[dict]]],
+    name: str = "TV Cal",
+    since: datetime | None = None,
+) -> Calendar:
+    """`since`, if given, drops episodes that aired before it -- otherwise a
+    long-running show fills the calendar with years of past episodes."""
     calendar = Calendar()
     calendar.add("prodid", "-//tvcal//TV Show Episode Tracker//EN")
     calendar.add("version", "2.0")
-    calendar.add("x-wr-calname", "TV Show Episodes")
+    calendar.add("x-wr-calname", name)
     calendar.add("method", "PUBLISH")
 
     for show, episodes in shows_with_episodes:
@@ -31,7 +39,7 @@ def build_calendar(shows_with_episodes: list[tuple[dict, list[dict]]]) -> Calend
 
         for episode in episodes:
             try:
-                event = build_event(show, episode)
+                event = build_event(show, episode, since)
             except Exception:
                 # TVMaze data is untrusted input -- an episode with a
                 # malformed field shouldn't take down every other show's
@@ -51,7 +59,7 @@ def build_calendar(shows_with_episodes: list[tuple[dict, list[dict]]]) -> Calend
     return calendar
 
 
-def build_event(show: dict, episode: dict) -> Event | None:
+def build_event(show: dict, episode: dict, since: datetime | None = None) -> Event | None:
     episode_id = episode.get("id")
     airstamp = episode.get("airstamp")
     if episode_id is None or not airstamp:
@@ -63,21 +71,37 @@ def build_event(show: dict, episode: dict) -> Event | None:
     except ValueError:
         logging.warning("Skipping episode %s with unparseable airstamp %r", episode_id, airstamp)
         return None
-
-    runtime_minutes = episode.get("runtime")
-    if runtime_minutes is None:
-        runtime_minutes = show.get("runtime")
-    if runtime_minutes is None:
-        runtime_minutes = DEFAULT_RUNTIME_MINUTES
-    end = start + timedelta(minutes=runtime_minutes)
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if since is not None and start < since:
+        return None
 
     event = Event()
     event.add("uid", f"tvmaze-episode-{episode_id}@tvcal")
     event.add("summary", _format_episode_title(show, episode))
-    event.add("dtstart", start)
-    event.add("dtend", end)
+
+    airdate = episode.get("airdate")
+    if not episode.get("airtime") and isinstance(airdate, str) and airdate:
+        # No announced time -- typical of streaming drops -- means the
+        # airstamp's hour is a placeholder, so an all-day event on the
+        # release date is the honest version.
+        day = date.fromisoformat(airdate)
+        event.add("dtstart", day)
+        event.add("dtend", day + timedelta(days=1))
+    else:
+        runtime_minutes = episode.get("runtime")
+        if runtime_minutes is None:
+            runtime_minutes = show.get("runtime")
+        if runtime_minutes is None:
+            runtime_minutes = DEFAULT_RUNTIME_MINUTES
+        event.add("dtstart", start)
+        event.add("dtend", start + timedelta(minutes=runtime_minutes))
+
     event.add("dtstamp", datetime.now(timezone.utc))
     event.add("description", _clean_summary(episode.get("summary")))
+    where = network_name(show)
+    if where:
+        event.add("location", where)
     if episode.get("url"):
         event.add("url", episode["url"])
     return event

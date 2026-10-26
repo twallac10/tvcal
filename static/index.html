@@ -29,6 +29,9 @@
     }
   }
   * { box-sizing: border-box; }
+  /* Without this, any element styled display:flex/grid ignores its hidden
+     attribute -- the sign-in page was showing the sign-up form too. */
+  [hidden] { display: none !important; }
   body {
     margin: 0;
     padding: 24px 16px 64px;
@@ -113,7 +116,7 @@
     flex-shrink: 0;
   }
   .show-info { flex: 1; min-width: 0; }
-  .show-info h3 { margin: 0; font-size: 0.98rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .show-info h3, .show-info .show-name { margin: 0; font-size: 0.98rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .show-info p { margin: 2px 0 0; font-size: 0.85rem; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #watchlist-items {
     list-style: none;
@@ -132,9 +135,46 @@
     border-radius: 8px;
     font-size: 0.95rem;
   }
-  .watchlist-item span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .feed-row { display: flex; gap: 8px; flex-wrap: wrap; }
   .feed-row input { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.85rem; flex: 1 1 220px; }
+  .subscribe-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  a.button-link {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 1 1 200px;
+    min-height: 44px;
+    padding: 12px 16px;
+    border-radius: 8px;
+    background: var(--accent);
+    color: var(--accent-text);
+    font-size: 0.9rem;
+    font-weight: 600;
+    text-decoration: none;
+  }
+  a.button-link.secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
+  button.link-btn {
+    background: none;
+    color: var(--danger);
+    padding: 0;
+    font-weight: 400;
+    text-decoration: underline;
+  }
+  #toast {
+    position: fixed;
+    left: 50%;
+    bottom: 24px;
+    transform: translateX(-50%);
+    width: max-content;
+    max-width: calc(100% - 32px);
+    padding: 12px 16px;
+    border-radius: 8px;
+    background: var(--text);
+    color: var(--bg);
+    font-size: 0.9rem;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+    z-index: 10;
+  }
   .hint { color: var(--text-muted); font-size: 0.85rem; margin: 10px 0 0; }
   .error { color: var(--danger); font-size: 0.85rem; margin: 10px 0 0; }
   .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; gap: 8px; }
@@ -151,6 +191,11 @@
     <h1><a href="/" id="home-link">TV Cal</a></h1>
     <p>Search TV shows, build a watchlist, subscribe to one calendar feed.</p>
   </header>
+
+  <section id="loading-section">
+    <p class="empty" id="loading-message">Loading…</p>
+    <button type="button" id="retry-btn" class="secondary" hidden>Try again</button>
+  </section>
 
   <section id="login-section" hidden>
     <h2 id="auth-heading">Sign in</h2>
@@ -207,24 +252,69 @@
           <input type="text" id="feed-url" readonly>
           <button type="button" id="copy-btn" class="secondary">Copy</button>
         </div>
-        <p class="hint">Paste this URL into Google Calendar, Apple Calendar, or Outlook as a subscription (not a one-time import). It always reflects your current watchlist. This link is read-only -- anyone who has it can see your episode schedule but can't change your watchlist.</p>
+        <div class="subscribe-row" id="subscribe-links" hidden>
+          <a id="apple-sub" class="button-link">Add to Apple Calendar</a>
+          <a id="google-sub" class="button-link secondary" target="_blank" rel="noopener">Add to Google Calendar</a>
+        </div>
+        <p class="hint">Or paste the link into Outlook or another calendar app as a subscription (not a one-time import). Google Calendar only lets you add it on a computer. It always reflects your current watchlist. The link is read-only: anyone who has it can see your episode schedule but can't change your watchlist.</p>
+        <button type="button" id="reset-feed-btn" class="link-btn" hidden>Reset calendar link</button>
       </section>
     </div>
   </div>
 </main>
 
+<div id="toast" role="status" aria-live="polite" hidden></div>
+
 <script>
   // searchSeq lets a slow search response notice it's been superseded (by
   // a newer search, or by going home) and drop itself instead of
-  // overwriting what's on screen.
-  const state = { username: null, feedToken: null, watchlist: [], searchSeq: 0 };
+  // overwriting what's on screen. upcomingSeq does the same for the
+  // watchlist's airdates.
+  const state = {
+    username: null,
+    feedToken: null,
+    watchlist: [],
+    upcoming: {},
+    searchSeq: 0,
+    upcomingSeq: 0,
+  };
+
+  const OFFLINE_MESSAGE = "Couldn't reach TV Cal. Check your connection and try again.";
+
+  // A network failure (offline, a dropped connection) comes back as a 503
+  // carrying OFFLINE_MESSAGE instead of throwing, so every caller's normal
+  // !res.ok path handles it -- a throw would skip that and leave the page
+  // stuck on "Adding…" or "Searching…".
+  async function safeFetch(url, options) {
+    try {
+      return await fetch(url, options);
+    } catch (err) {
+      return new Response(OFFLINE_MESSAGE, { status: 503 });
+    }
+  }
 
   async function apiFetch(url, options) {
-    const res = await fetch(url, options);
+    const res = await safeFetch(url, options);
     if (res.status === 401) {
       showLoginForm();
     }
     return res;
+  }
+
+  // The server's own errors are short plain-text messages worth showing;
+  // anything else (an HTML error page from the platform) isn't.
+  async function errorMessage(res, fallback) {
+    const text = (await res.text()).trim();
+    return text && text.length <= 200 && !text.startsWith("<") ? text : fallback;
+  }
+
+  let toastTimer = null;
+  function notify(message) {
+    const toast = document.getElementById("toast");
+    toast.textContent = message;
+    toast.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { toast.hidden = true; }, 5000);
   }
 
   function setAuthMode(mode) {
@@ -246,14 +336,23 @@
     state.username = null;
     state.feedToken = null;
     state.watchlist = [];
+    state.upcoming = {};
+    state.upcomingSeq++;
     showHomeView();
+    // Likewise their search: showApp() restores results from history, so
+    // the next person to sign in on this tab would land on it.
+    if (history.state && history.state.view === "results") {
+      history.replaceState(null, "");
+    }
 
+    document.getElementById("loading-section").hidden = true;
     document.getElementById("login-section").hidden = false;
     document.getElementById("app-section").hidden = true;
     setAuthMode("login");
   }
 
   function showApp() {
+    document.getElementById("loading-section").hidden = true;
     document.getElementById("login-section").hidden = true;
     document.getElementById("app-section").hidden = false;
     document.getElementById("signed-in-as").textContent = state.username
@@ -308,8 +407,18 @@
   });
 
   async function checkAuthAndInit() {
-    const res = await fetch("/auth/status");
-    const data = res.ok ? await res.json() : { authenticated: false, username: null };
+    const message = document.getElementById("loading-message");
+    const retryBtn = document.getElementById("retry-btn");
+    message.textContent = "Loading…";
+    retryBtn.hidden = true;
+
+    const res = await safeFetch("/auth/status");
+    if (!res.ok) {
+      message.textContent = await errorMessage(res, "TV Cal isn't responding. Try again in a moment.");
+      retryBtn.hidden = false;
+      return;
+    }
+    const data = await res.json();
     if (data.authenticated) {
       state.username = data.username;
       showApp();
@@ -320,8 +429,7 @@
 
   async function showAuthError(res, fallback) {
     const errorEl = document.getElementById("login-error");
-    const message = (await res.text()) || fallback;
-    errorEl.textContent = message;
+    errorEl.textContent = await errorMessage(res, fallback);
     errorEl.hidden = false;
   }
 
@@ -331,7 +439,12 @@
 
   async function loadWatchlist() {
     const res = await apiFetch("/watchlist");
-    state.watchlist = res.ok ? await res.json() : [];
+    if (res.ok) {
+      state.watchlist = await res.json();
+      loadUpcoming(); // not awaited: airdates fill in when TVMaze answers
+    } else if (res.status !== 401) {
+      notify(await errorMessage(res, "Couldn't load your watchlist."));
+    }
     renderWatchlist();
 
     if (!state.feedToken) {
@@ -339,6 +452,17 @@
     } else {
       renderFeedUrl();
     }
+  }
+
+  async function loadUpcoming() {
+    const seq = ++state.upcomingSeq;
+    const res = await apiFetch("/watchlist/upcoming");
+    // Airdates are an extra: on failure the list just shows names.
+    if (seq !== state.upcomingSeq || !res.ok) return;
+    const upcoming = await res.json();
+    if (seq !== state.upcomingSeq) return;
+    state.upcoming = Object.fromEntries(upcoming.map((show) => [show.id, show]));
+    renderWatchlist();
   }
 
   async function loadFeedToken() {
@@ -350,9 +474,33 @@
   }
 
   function renderFeedUrl() {
-    document.getElementById("feed-url").value = state.feedToken
+    const url = state.feedToken
       ? `${location.origin}/calendar.ics?feed=${encodeURIComponent(state.feedToken)}`
       : "";
+    document.getElementById("feed-url").value = url;
+
+    // webcal:// is the subscribe-to-a-calendar scheme: on an iPhone or Mac
+    // it opens Calendar's subscribe prompt directly. Google takes the same
+    // URL through its "add by URL" page.
+    const webcal = url.replace(/^https?:/, "webcal:");
+    document.getElementById("apple-sub").href = webcal;
+    document.getElementById("google-sub").href =
+      `https://calendar.google.com/calendar/render?cid=${encodeURIComponent(webcal)}`;
+    document.getElementById("subscribe-links").hidden = !url;
+    document.getElementById("reset-feed-btn").hidden = !url;
+  }
+
+  // Soonest-airing first, so what's on next is at the top; shows with
+  // nothing scheduled follow in the server's (alphabetical) order.
+  function sortedWatchlist() {
+    const nextAirs = (show) => {
+      const episodes = state.upcoming[show.id] && state.upcoming[show.id].next_episodes;
+      return episodes && episodes.length ? Date.parse(episodes[0].airstamp) : Infinity;
+    };
+    return [...state.watchlist].sort((a, b) => {
+      const [x, y] = [nextAirs(a), nextAirs(b)];
+      return x === y ? 0 : x - y;
+    });
   }
 
   function renderWatchlist() {
@@ -360,25 +508,43 @@
     list.innerHTML = "";
 
     if (state.watchlist.length === 0) {
-      const empty = document.createElement("p");
+      const empty = document.createElement("li");
       empty.className = "empty";
       empty.textContent = "No shows yet. Search above and add some.";
       list.appendChild(empty);
       return;
     }
 
-    for (const show of state.watchlist) {
+    for (const show of sortedWatchlist()) {
       const item = document.createElement("li");
       item.className = "watchlist-item";
 
-      const name = document.createElement("span");
+      const info = document.createElement("div");
+      info.className = "show-info";
+      const name = document.createElement("div");
+      name.className = "show-name";
       name.textContent = show.name;
-      item.appendChild(name);
+      info.appendChild(name);
+      // Just the next episode here -- the watchlist is for a quick glance.
+      const upcoming = state.upcoming[show.id];
+      const [nextLine] = upcoming ? airdateLines(upcoming) : [];
+      if (nextLine) {
+        info.appendChild(airdateParagraph(nextLine));
+      }
+      item.appendChild(info);
 
       const removeBtn = document.createElement("button");
       removeBtn.textContent = "Remove";
       removeBtn.className = "remove-btn";
-      removeBtn.addEventListener("click", () => removeShow(show.id));
+      removeBtn.setAttribute("aria-label", `Remove ${show.name}`);
+      removeBtn.addEventListener("click", async () => {
+        removeBtn.disabled = true;
+        removeBtn.textContent = "Removing…";
+        if (!(await removeShow(show.id, show.name))) {
+          removeBtn.disabled = false;
+          removeBtn.textContent = "Remove";
+        }
+      });
       item.appendChild(removeBtn);
 
       list.appendChild(item);
@@ -406,10 +572,14 @@
     if (res.status === 401) return; // apiFetch already showed the login form
 
     if (!res.ok) {
-      renderSearchMessage("Couldn't reach TVMaze. Try again in a moment.");
+      const message = res.status === 502
+        ? "Couldn't reach TVMaze. Try again in a moment."
+        : await errorMessage(res, "Search failed. Try again in a moment.");
+      if (seq === state.searchSeq) renderSearchMessage(message);
       return;
     }
-    renderResults(await res.json());
+    const results = await res.json();
+    if (seq === state.searchSeq) renderResults(results);
   }
 
   function renderSearchMessage(text) {
@@ -470,6 +640,13 @@
     });
   }
 
+  function airdateParagraph(line) {
+    const p = document.createElement("p");
+    p.className = line.upcoming ? "airdate upcoming" : "airdate";
+    p.textContent = line.text;
+    return p;
+  }
+
   function buildShowCard(show) {
     const card = document.createElement("div");
     card.className = "show-card";
@@ -495,58 +672,70 @@
     info.appendChild(meta);
 
     for (const line of airdateLines(show)) {
-      const p = document.createElement("p");
-      p.className = line.upcoming ? "airdate upcoming" : "airdate";
-      p.textContent = line.text;
-      info.appendChild(p);
+      info.appendChild(airdateParagraph(line));
     }
 
     card.appendChild(info);
 
     const button = document.createElement("button");
-    renderWatchlistToggle(button, show.id);
+    renderWatchlistToggle(button, show);
     button.addEventListener("click", async () => {
       const removing = isInWatchlist(show.id);
       button.disabled = true;
       button.textContent = removing ? "Removing…" : "Adding…";
       if (removing) {
-        await removeShow(show.id);
+        await removeShow(show.id, show.name);
       } else {
         await addShow(show.id, show.name);
       }
-      // Re-derive from the reloaded watchlist rather than assuming the
-      // request did what was asked -- a failed add or remove just leaves
-      // the button showing the true state, ready to retry.
-      renderWatchlistToggle(button, show.id);
+      // Re-derive from the watchlist rather than assuming the request did
+      // what was asked -- a failed add or remove just leaves the button
+      // showing the true state, ready to retry.
+      renderWatchlistToggle(button, show);
     });
     card.appendChild(button);
 
     return card;
   }
 
-  function renderWatchlistToggle(button, showId) {
-    const added = isInWatchlist(showId);
+  function renderWatchlistToggle(button, show) {
+    const added = isInWatchlist(show.id);
     button.disabled = false;
     button.textContent = added ? "Remove" : "+ Add";
     button.className = added ? "remove-btn" : "";
+    button.setAttribute(
+      "aria-label",
+      added ? `Remove ${show.name} from watchlist` : `Add ${show.name} to watchlist`,
+    );
   }
 
+  // Both return whether the change went through, and say why if it didn't
+  // (a full watchlist, no connection) instead of failing silently.
   async function addShow(id, name) {
     const res = await apiFetch("/watchlist", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ show_id: id, show_name: name }),
     });
-    if (res.ok) {
-      await loadWatchlist();
+    if (!res.ok) {
+      if (res.status !== 401) notify(await errorMessage(res, `Couldn't add ${name}. Try again.`));
+      return false;
     }
+    // Reflect the change now, even if the reload below fails.
+    if (!isInWatchlist(id)) state.watchlist.push({ id, name });
+    await loadWatchlist();
+    return true;
   }
 
-  async function removeShow(id) {
+  async function removeShow(id, name) {
     const res = await apiFetch(`/watchlist/${id}`, { method: "DELETE" });
-    if (res.ok) {
-      await loadWatchlist();
+    if (!res.ok) {
+      if (res.status !== 401) notify(await errorMessage(res, `Couldn't remove ${name}. Try again.`));
+      return false;
     }
+    state.watchlist = state.watchlist.filter((show) => show.id !== id);
+    await loadWatchlist();
+    return true;
   }
 
   document.getElementById("search-form").addEventListener("submit", (event) => {
@@ -562,18 +751,45 @@
     goHome();
   });
 
+  document.getElementById("retry-btn").addEventListener("click", checkAuthAndInit);
+
   document.getElementById("copy-btn").addEventListener("click", async () => {
     const input = document.getElementById("feed-url");
     input.select();
+    let copied = true;
     try {
       await navigator.clipboard.writeText(input.value);
     } catch (err) {
-      document.execCommand("copy");
+      copied = document.execCommand("copy");
+    }
+    if (!copied) {
+      notify("Couldn't copy automatically. The link is selected: copy it from there.");
+      return;
     }
     const btn = document.getElementById("copy-btn");
     const original = btn.textContent;
     btn.textContent = "Copied!";
     setTimeout(() => { btn.textContent = original; }, 1500);
+  });
+
+  document.getElementById("reset-feed-btn").addEventListener("click", async () => {
+    const confirmed = confirm(
+      "Reset your calendar link?\n\nCalendars subscribed with the current link will stop " +
+      "updating, and you'll need to subscribe again with the new one.",
+    );
+    if (!confirmed) return;
+
+    const btn = document.getElementById("reset-feed-btn");
+    btn.disabled = true;
+    const res = await apiFetch("/watchlist/feed-token/reset", { method: "POST" });
+    btn.disabled = false;
+    if (res.ok) {
+      state.feedToken = (await res.json()).feed_token;
+      renderFeedUrl();
+      notify("New calendar link created. Subscribe your calendars to it again.");
+    } else if (res.status !== 401) {
+      notify(await errorMessage(res, "Couldn't reset the link. Try again."));
+    }
   });
 
   document.getElementById("auth-mode-toggle").addEventListener("click", (event) => {
@@ -582,17 +798,33 @@
     setAuthMode(isSignup ? "login" : "signup");
   });
 
+  // Signing in deliberately hashes the password slowly, and an idle app can
+  // take a few seconds to wake up -- so show that something's happening,
+  // and don't let a second tap send it twice.
+  async function postAuth(form, url, payload, busyLabel) {
+    const button = form.querySelector("button[type=submit]");
+    const label = button.textContent;
+    button.disabled = true;
+    button.textContent = busyLabel;
+    document.getElementById("login-error").hidden = true;
+    try {
+      return await safeFetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    } finally {
+      button.disabled = false;
+      button.textContent = label;
+    }
+  }
+
   document.getElementById("login-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const username = document.getElementById("login-username").value.trim();
     const password = document.getElementById("login-password").value;
-    document.getElementById("login-error").hidden = true;
 
-    const res = await fetch("/auth/login", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, password }),
-    });
+    const res = await postAuth(event.target, "/auth/login", { username, password }, "Signing in…");
 
     if (res.ok) {
       document.getElementById("login-password").value = "";
@@ -608,22 +840,17 @@
     const username = document.getElementById("signup-username").value.trim();
     const password = document.getElementById("signup-password").value;
     const signupCode = document.getElementById("signup-code").value;
-    document.getElementById("login-error").hidden = true;
 
     // A pre-account browser may already have a watchlist under the old
     // localStorage-token scheme -- fold it into the new account, once.
     const previousToken = localStorage.getItem("tvcal_list_token") || undefined;
 
-    const res = await fetch("/auth/signup", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        username,
-        password,
-        signup_code: signupCode,
-        previous_token: previousToken,
-      }),
-    });
+    const res = await postAuth(event.target, "/auth/signup", {
+      username,
+      password,
+      signup_code: signupCode,
+      previous_token: previousToken,
+    }, "Creating account…");
 
     if (res.ok) {
       localStorage.removeItem("tvcal_list_token");
@@ -637,7 +864,7 @@
   });
 
   document.getElementById("logout-btn").addEventListener("click", async () => {
-    await fetch("/auth/logout", { method: "POST" });
+    await safeFetch("/auth/logout", { method: "POST" });
     showLoginForm();
   });
 
