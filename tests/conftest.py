@@ -5,6 +5,7 @@ import itertools
 
 from azure.core import MatchConditions
 from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
+from azure.data.tables import UpdateMode
 
 import auth
 import storage
@@ -51,44 +52,47 @@ class FakeEntity(dict):
 
 
 class FakeTableClient:
-    """In-memory stand-in for azure.data.tables.TableClient."""
+    """In-memory stand-in for azure.data.tables.TableClient, matching the
+    real one where the code relies on it: etags and conditional updates,
+    MERGE (the default) vs REPLACE, entities returned as copies, and
+    deleting a missing row being a no-op."""
 
     def __init__(self):
         self.rows: dict[tuple[str, str], dict] = {}
         self._etags = itertools.count(1)
 
-    def _store(self, entity):
+    def _store(self, entity, mode):
         key = (entity["PartitionKey"], entity["RowKey"])
-        self.rows[key] = FakeEntity(entity, f"etag-{next(self._etags)}")
+        existing = self.rows.get(key) if mode == UpdateMode.MERGE else None
+        merged = {**(existing or {}), **entity}
+        self.rows[key] = FakeEntity(merged, f"etag-{next(self._etags)}")
 
-    def upsert_entity(self, entity):
-        self._store(entity)
+    def upsert_entity(self, entity, mode=UpdateMode.MERGE):
+        self._store(entity, mode)
 
     def create_entity(self, entity):
         key = (entity["PartitionKey"], entity["RowKey"])
         if key in self.rows:
             raise ResourceExistsError("already exists")
-        self._store(entity)
+        self._store(entity, UpdateMode.REPLACE)
 
-    def update_entity(self, entity, mode=None, *, etag=None, match_condition=None):
+    def update_entity(self, entity, mode=UpdateMode.MERGE, *, etag=None, match_condition=None):
         key = (entity["PartitionKey"], entity["RowKey"])
         if key not in self.rows:
             raise ResourceNotFoundError("not found")
         if match_condition == MatchConditions.IfNotModified and etag != self.rows[key].metadata["etag"]:
             raise ResourceModifiedError("etag mismatch")
-        self._store(entity)
+        self._store(entity, mode)
 
     def get_entity(self, partition_key, row_key):
         key = (partition_key, row_key)
         if key not in self.rows:
             raise ResourceNotFoundError("not found")
-        return self.rows[key]
+        stored = self.rows[key]
+        return FakeEntity(stored, stored.metadata["etag"])
 
     def delete_entity(self, partition_key, row_key):
-        key = (partition_key, row_key)
-        if key not in self.rows:
-            raise ResourceNotFoundError("not found")
-        del self.rows[key]
+        self.rows.pop((partition_key, row_key), None)
 
     def query_entities(self, query_filter, select=None):
         quoted = re.findall(r"'([^']*)'", query_filter)

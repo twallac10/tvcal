@@ -181,6 +181,8 @@
   .topbar span { color: var(--text-muted); font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .auth-form { display: flex; flex-direction: column; gap: 10px; }
   .auth-links { margin-top: 12px; }
+  summary { cursor: pointer; font-weight: 600; font-size: 1.05rem; }
+  details[open] summary { margin-bottom: 14px; }
   .auth-links a { color: var(--accent); text-decoration: none; font-size: 0.9rem; }
   .auth-links a:hover { text-decoration: underline; }
 </style>
@@ -258,6 +260,22 @@
         </div>
         <p class="hint">Or paste the link into Outlook or another calendar app as a subscription (not a one-time import). Google Calendar only lets you add it on a computer. It always reflects your current watchlist. The link is read-only: anyone who has it can see your episode schedule but can't change your watchlist.</p>
         <button type="button" id="reset-feed-btn" class="link-btn" hidden>Reset calendar link</button>
+      </section>
+
+      <section id="account">
+        <details id="password-details">
+          <summary>Change password</summary>
+          <form id="password-form" class="auth-form">
+            <!-- Lets password managers tie the new password to this account. -->
+            <input type="text" id="password-form-username" autocomplete="username" hidden>
+            <input type="password" id="current-password" placeholder="Current password" autocomplete="current-password" required>
+            <input type="password" id="new-password" placeholder="New password (min 8 characters)" autocomplete="new-password" minlength="8" required>
+            <input type="password" id="repeat-password" placeholder="New password again" autocomplete="new-password" minlength="8" required>
+            <button type="submit">Change password</button>
+          </form>
+          <p id="password-error" class="error" hidden></p>
+          <p class="hint">This signs you out on your other devices. It doesn't change your calendar link: if someone else might have that too, use "Reset calendar link" above.</p>
+        </details>
       </section>
     </div>
   </div>
@@ -348,6 +366,13 @@
       history.replaceState(null, "");
     }
 
+    // Don't leave a half-typed password (or this account's name) behind for
+    // whoever signs in next.
+    document.getElementById("password-form-username").defaultValue = "";
+    document.getElementById("password-form").reset();
+    document.getElementById("password-error").hidden = true;
+    document.getElementById("password-details").open = false;
+
     document.getElementById("loading-section").hidden = true;
     document.getElementById("login-section").hidden = false;
     document.getElementById("app-section").hidden = true;
@@ -361,6 +386,8 @@
     document.getElementById("signed-in-as").textContent = state.username
       ? `Signed in as ${state.username}`
       : "";
+    // defaultValue, not value, so the form's reset() after a change keeps it.
+    document.getElementById("password-form-username").defaultValue = state.username || "";
     loadWatchlist();
 
     // A reload (or re-login) while on a results page stays on it.
@@ -876,6 +903,40 @@
       showApp();
     } else {
       await showAuthError(res, "Couldn't create account.");
+    }
+  });
+
+  document.getElementById("password-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.target;
+    const errorEl = document.getElementById("password-error");
+    const currentPassword = document.getElementById("current-password").value;
+    const newPassword = document.getElementById("new-password").value;
+    errorEl.hidden = true;
+    if (newPassword !== document.getElementById("repeat-password").value) {
+      errorEl.textContent = "The new passwords don't match.";
+      errorEl.hidden = false;
+      return;
+    }
+
+    const button = form.querySelector("button[type=submit]");
+    button.disabled = true;
+    button.textContent = "Changing…";
+    const res = await apiFetch("/auth/change-password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+    });
+    button.disabled = false;
+    button.textContent = "Change password";
+
+    if (res.ok) {
+      form.reset();
+      document.getElementById("password-details").open = false;
+      notify("Password changed. Your other devices have been signed out.");
+    } else if (res.status !== 401) {
+      errorEl.textContent = await errorMessage(res, "Couldn't change your password. Try again.");
+      errorEl.hidden = false;
     }
   });
 

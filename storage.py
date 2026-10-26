@@ -76,6 +76,10 @@ class TooManyAccounts(Exception):
     """Raised once MAX_ACCOUNTS accounts already exist."""
 
 
+class AccountChanged(Exception):
+    """Raised when an account changed after the caller read it."""
+
+
 def validate_token(token: str) -> None:
     if not _TOKEN_RE.match(token or "") or token in RESERVED_TOKENS:
         raise InvalidListToken(
@@ -282,4 +286,30 @@ def get_account(username: str) -> dict:
         "password_hash": entity["PasswordHash"],
         "salt": entity["Salt"],
         "iterations": entity["Iterations"],
+        "etag": entity.metadata["etag"],
     }
+
+
+def set_password(username: str, password_hash: str, salt: str, iterations: int, etag: str) -> None:
+    """Replace an account's password, if the account is unchanged since the
+    read that `etag` came from (see auth.change_password); raises
+    AccountChanged otherwise, rather than retrying past whatever changed."""
+    validate_token(username)
+    client = _table_client()
+    try:
+        client.update_entity(
+            {
+                "PartitionKey": _ACCOUNTS_PARTITION,
+                "RowKey": username,
+                "PasswordHash": password_hash,
+                "Salt": salt,
+                "Iterations": iterations,
+            },
+            mode=UpdateMode.REPLACE,
+            etag=etag,
+            match_condition=MatchConditions.IfNotModified,
+        )
+    except ResourceNotFoundError:
+        raise UnknownAccount(f"No account for username '{username}'.")
+    except ResourceModifiedError:
+        raise AccountChanged(f"Account '{username}' changed while this was in progress.")

@@ -25,11 +25,24 @@ rotating/blanking `SIGNUP_CODE` once everyone who needs one has signed up.
 A session cookie (HttpOnly, 30 days) keeps you signed in after that, with a
 "Log out" button to end it early.
 
-**What this deliberately doesn't have**, since it's a two-person app: no
-password change, no password reset, and no per-account session revocation.
-If a password needs changing you edit (or delete) that account's row in
-Table Storage by hand; the only session kill switch is rotating
-`SESSION_SECRET`, which signs everyone out at once.
+**Changing a password** ("Change password" at the bottom of the home page)
+signs that account out on every other device. Each session is bound to the
+exact password it was signed in with, through a keyed fingerprint of the
+password hash in the cookie, so it stops working once that password changes.
+It also stops working if the account is deleted, even if the same username
+signs up again later. Checking this costs one account read per request. A
+password change also only lands if the account is unchanged since its
+current password was checked, so two changes at once can't overwrite each
+other.
+
+Changing a password doesn't change the calendar link. If someone else might
+have that too, use "Reset calendar link" as well.
+
+**Forgotten passwords**: accounts have no email address, so there's no
+self-service reset. Whoever runs the app resets it from their own machine
+(see **Resetting a forgotten password** below), and the person then changes
+it in the app. Rotating `SESSION_SECRET` is still there as a kill switch
+that signs everyone out at once.
 
 `/calendar.ics` is deliberately **not** behind this login: calendar apps
 fetch that URL directly with no cookies at all, so it's gated only by its
@@ -71,6 +84,11 @@ valid session cookie (see **Signing in**).
   all (signups closed). Passwords are capped at 1024 characters — these
   endpoints are anonymous and always run PBKDF2.
 - `POST /auth/login` — body `{"username", "password"}`. Sets the session cookie.
+- `POST /auth/change-password` — body `{"current_password", "new_password"}`,
+  with a session. Signs the account out everywhere else and returns a fresh
+  session cookie for this device. `403` for a wrong current password (not
+  `401`, since the session itself is fine), `400` for a new password outside
+  8–1024 characters.
 - `POST /auth/logout` — clears the session cookie.
 - `GET /auth/status` — `{"authenticated": bool, "username": str | null}` for
   the current cookie.
@@ -315,6 +333,26 @@ az functionapp config appsettings set \
   --settings SIGNUP_CODE=<new value>
 ```
 
+## Resetting a forgotten password
+
+Run this from your own machine, in a checkout with the requirements
+installed (`pip install -r requirements.txt`). It prompts for the new
+password, and signs that account out everywhere:
+
+```bash
+AzureWebJobsStorage="$(az functionapp config appsettings list \
+  --name <function-app-name> --resource-group <resource-group> \
+  --query "[?name=='AzureWebJobsStorage'].value" -o tsv)" \
+  python scripts/reset_password.py <username>
+```
+
+The connection string is set for that one command only, so it doesn't stay
+in your shell.
+
+Tell them the new password, and have them change it under "Change
+password" once they're signed in. The script isn't deployed with the app
+(`scripts/` is in `.funcignore`).
+
 ## Project layout
 
 - `function_app.py` — HTTP-triggered functions (UI, auth, search, watchlist, calendar feed)
@@ -322,5 +360,6 @@ az functionapp config appsettings set \
 - `tvmaze_client.py` — thin wrapper around the TVMaze REST API
 - `ical_builder.py` — builds the `.ics` calendar from TVMaze show/episode data
 - `storage.py` — watchlist and account persistence in Azure Table Storage
+- `scripts/reset_password.py` — resets a forgotten password (run locally, not deployed)
 - `static/index.html` — the login + search + watchlist single-page UI
 - `tests/` — unit tests (mocked TVMaze/Table Storage, no network calls)

@@ -134,6 +134,7 @@ def test_create_and_get_account(fake_client):
     storage.create_account("alice", "hash123", "salt456", 600_000)
 
     account = storage.get_account("alice")
+    assert account.pop("etag")
     assert account == {"password_hash": "hash123", "salt": "salt456", "iterations": 600_000}
 
 
@@ -166,11 +167,7 @@ def test_accounts_partition_does_not_collide_with_a_same_named_watchlist(fake_cl
     storage.create_account("alice", "hash1", "salt1", 600_000)
 
     assert storage.list_shows("alice") == [{"id": 82, "name": "Fringe"}]
-    assert storage.get_account("alice") == {
-        "password_hash": "hash1",
-        "salt": "salt1",
-        "iterations": 600_000,
-    }
+    assert storage.get_account("alice")["password_hash"] == "hash1"
 
 
 def test_feed_token_survives_a_failure_between_its_two_writes(fake_client):
@@ -279,3 +276,34 @@ def test_concurrent_resets_leave_no_token_that_cant_be_revoked(fake_client, monk
     assert this_tab == other_tab["token"] == current
     resolvable = {row_key for (partition, row_key) in fake_client.rows if partition == "__feed_index__"}
     assert resolvable == {current}
+
+
+# -- set_password -------------------------------------------------------
+
+
+def test_set_password_replaces_the_credentials(fake_client):
+    storage.create_account("alice", "old-hash", "old-salt", 600_000)
+    etag = storage.get_account("alice")["etag"]
+
+    storage.set_password("alice", "new-hash", "new-salt", 700_000, etag)
+
+    account = storage.get_account("alice")
+    assert account["etag"] != etag
+    del account["etag"]
+    assert account == {"password_hash": "new-hash", "salt": "new-salt", "iterations": 700_000}
+
+
+def test_set_password_refuses_if_the_account_changed_since_it_was_read(fake_client):
+    storage.create_account("alice", "h0", "s0", 1)
+    stale_etag = storage.get_account("alice")["etag"]
+    storage.set_password("alice", "h-other", "s-other", 1, stale_etag)  # someone else, first
+
+    with pytest.raises(storage.AccountChanged):
+        storage.set_password("alice", "h-mine", "s-mine", 1, stale_etag)
+
+    assert storage.get_account("alice")["password_hash"] == "h-other"
+
+
+def test_set_password_for_an_unknown_account_raises(fake_client):
+    with pytest.raises(storage.UnknownAccount):
+        storage.set_password("nobody", "h", "s", 1, "etag-1")
