@@ -82,7 +82,9 @@ def check_signup_code(code: str) -> bool:
     expected = os.environ.get("SIGNUP_CODE")
     if not expected:
         raise AuthConfigError("SIGNUP_CODE app setting is not configured.")
-    return hmac.compare_digest(code, expected)
+    # Bytes, not str: compare_digest raises on non-ASCII strings, so a typo'd
+    # code with, say, an iPhone smart dash would 500 instead of being refused.
+    return hmac.compare_digest(code.encode("utf-8"), expected.encode("utf-8"))
 
 
 def create_account(username: str, password: str) -> str:
@@ -169,7 +171,7 @@ def _parse_session_cookie(req: func.HttpRequest) -> str | None:
     except AuthConfigError:
         # Fail closed: if the server isn't configured, no one is authenticated.
         return None
-    if not hmac.compare_digest(signature, expected_signature):
+    if not hmac.compare_digest(signature.encode("utf-8"), expected_signature.encode("utf-8")):
         return None
     return username
 

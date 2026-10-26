@@ -3,13 +3,23 @@ import concurrent.futures
 import json
 import logging
 import pathlib
+import time
+from datetime import datetime, timedelta, timezone
 
 import azure.functions as func
 
 import auth
 import storage
 from ical_builder import build_calendar
-from tvmaze_client import TVMazeError, get_show_with_episodes, search_shows
+from tvmaze_client import (
+    EPISODE_HISTORY_DAYS,
+    TVMazeBusy,
+    TVMazeError,
+    get_show_with_episodes,
+    network_name,
+    search_shows,
+    upcoming_episodes,
+)
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
@@ -22,6 +32,26 @@ MIN_PASSWORD_LENGTH = 8
 # unbounded password would let anyone make the worker hash an arbitrarily
 # large string (a 50MB body OOMs a Consumption instance).
 MAX_PASSWORD_LENGTH = 1024
+# How long a request's TVMaze lookups may take in total -- waiting on the
+# rate limit and downloading -- before it answers without the stragglers.
+# For search and the watchlist those just show no airdate (and still finish
+# in the background, warming the cache); the search page is interactive, so
+# it gets less patience than the watchlist.
+SEARCH_LOOKUP_WAIT_SECONDS = 5
+WATCHLIST_LOOKUP_WAIT_SECONDS = 20
+# The calendar can't skip a show, so it waits as long as a full 100-show
+# watchlist needs (~55s paced), within Azure's 230s HTTP request limit.
+CALENDAR_LOOKUP_WAIT_SECONDS = 150
+
+
+def _json_object(req: func.HttpRequest) -> dict | None:
+    """The request body as a JSON object, or None if it's anything else
+    (malformed, or valid JSON that isn't an object, like a list)."""
+    try:
+        body = req.get_json()
+    except ValueError:
+        return None
+    return body if isinstance(body, dict) else None
 
 
 @app.route(route="/", methods=["GET"])
@@ -39,24 +69,19 @@ def index(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="auth/signup", methods=["POST"])
 def auth_signup(req: func.HttpRequest) -> func.HttpResponse:
-    """POST /auth/signup  body: {"username", "password", "signup_code", "previous_token"?}.
+    """POST /auth/signup  body: {"username", "password", "signup_code"}.
 
     signup_code gates account creation (see the SIGNUP_CODE app setting) --
     it's shared out-of-band with whoever should get an account, same trust
     model as the old shared password, but only for this one step.
-    previous_token, if given, is a pre-account browser's watchlist token
-    (localStorage) to fold into the new account -- best-effort, ignored if
-    missing/invalid so it never blocks signup itself.
     """
-    try:
-        body = req.get_json()
-    except ValueError:
-        return func.HttpResponse("Request body must be JSON.", status_code=400)
+    body = _json_object(req)
+    if body is None:
+        return func.HttpResponse("Request body must be a JSON object.", status_code=400)
 
     username = body.get("username")
     password = body.get("password")
     signup_code = body.get("signup_code")
-    previous_token = body.get("previous_token")
 
     if (
         not isinstance(username, str)
@@ -93,12 +118,6 @@ def auth_signup(req: func.HttpRequest) -> func.HttpResponse:
     except storage.TooManyAccounts as exc:
         return func.HttpResponse(str(exc), status_code=403)
 
-    if isinstance(previous_token, str) and previous_token:
-        try:
-            storage.migrate_watchlist(previous_token, normalized_username)
-        except storage.InvalidListToken:
-            pass  # stale/malformed previous_token -- signup still succeeds
-
     try:
         cookie = auth.create_session_cookie(normalized_username)
     except auth.AuthConfigError:
@@ -111,10 +130,9 @@ def auth_signup(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="auth/login", methods=["POST"])
 def auth_login(req: func.HttpRequest) -> func.HttpResponse:
     """POST /auth/login  body: {"username": str, "password": str} -> sets the session cookie."""
-    try:
-        body = req.get_json()
-    except ValueError:
-        return func.HttpResponse("Request body must be JSON.", status_code=400)
+    body = _json_object(req)
+    if body is None:
+        return func.HttpResponse("Request body must be a JSON object.", status_code=400)
 
     username = body.get("username")
     password = body.get("password")
@@ -157,7 +175,7 @@ def auth_status(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="shows/search", methods=["GET"])
 @auth.require_session
 def search(req: func.HttpRequest) -> func.HttpResponse:
-    """GET /shows/search?q=<name> -> matching shows with their TVMaze IDs."""
+    """GET /shows/search?q=<name> -> matching shows, with their next episodes."""
     query = req.params.get("q")
     if not query:
         return func.HttpResponse("Query parameter 'q' is required.", status_code=400)
@@ -170,7 +188,7 @@ def search(req: func.HttpRequest) -> func.HttpResponse:
                 "name": show["name"],
                 "premiered": show.get("premiered"),
                 "status": show.get("status"),
-                "network": ((show.get("network") or show.get("webChannel")) or {}).get("name"),
+                "network": network_name(show),
                 "image": (show.get("image") or {}).get("medium"),
                 "summary": show.get("summary"),
             }
@@ -180,7 +198,80 @@ def search(req: func.HttpRequest) -> func.HttpResponse:
         logging.exception("TVMaze search failed for query=%s", query)
         return func.HttpResponse("Failed to reach TVMaze.", status_code=502)
 
+    next_episodes = _next_episodes_by_show(shows)
+    for result in results:
+        result["next_episodes"] = next_episodes.get(result["id"], [])
+
     return func.HttpResponse(json.dumps(results), status_code=200, mimetype="application/json")
+
+
+def _might_have_upcoming_episodes(show: dict) -> bool:
+    # TVMaze only includes a nextepisode link when one is actually
+    # scheduled, so this skips the extra fetch for ended shows and for
+    # running shows between announcements.
+    links = show.get("_links")
+    if isinstance(links, dict):
+        return "nextepisode" in links
+    return show.get("status") != "Ended"
+
+
+def _fetch_shows(show_ids: list[int], deadline: float) -> dict:
+    """Look up shows on TVMaze concurrently: show_id -> (show, episodes), or
+    the exception that show's lookup raised. A lookup still running at
+    `deadline` (a time.monotonic() value) maps to TVMazeBusy -- the deadline
+    bounds this call's total time, not just rate-limit waits."""
+    found = {}
+    if not show_ids:
+        return found
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TVMAZE_FETCHES)
+    future_to_show_id = {
+        pool.submit(get_show_with_episodes, show_id, deadline=deadline): show_id
+        for show_id in show_ids
+    }
+    try:
+        done, _ = concurrent.futures.wait(
+            future_to_show_id, timeout=max(0.0, deadline - time.monotonic())
+        )
+    finally:
+        # Don't wait for stragglers: lookups already running finish in the
+        # background (and still fill the cache), queued ones are dropped.
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    for future, show_id in future_to_show_id.items():
+        if future not in done:
+            found[show_id] = TVMazeBusy(f"Ran out of time looking up show_id={show_id}.")
+            continue
+        try:
+            found[show_id] = future.result()
+        except Exception as exc:
+            found[show_id] = exc
+    return found
+
+
+def _upcoming_or_none(show_id: int, result, now: datetime) -> list[dict] | None:
+    """A _fetch_shows() result as next_episodes: None ("unknown") for a failed
+    lookup, which only ever costs one show its airdates."""
+    if isinstance(result, Exception):
+        if not isinstance(result, TVMazeBusy):
+            logging.warning("Couldn't look up upcoming episodes for show_id=%s", show_id, exc_info=result)
+        return None
+    _, episodes = result
+    return upcoming_episodes(episodes, now)
+
+
+def _next_episodes_by_show(shows: list[dict]) -> dict:
+    """Best-effort upcoming-episode lookup for each search result.
+
+    Search results don't include episodes, so this costs one TVMaze request
+    per candidate show, made concurrently. A failed lookup maps to None
+    ("unknown"), not [] ("nothing scheduled"), and never fails the search
+    itself -- unlike the calendar feed, a search result missing an airdate
+    is harmless.
+    """
+    candidates = [show["id"] for show in shows if _might_have_upcoming_episodes(show)]
+    now = datetime.now(timezone.utc)
+    fetched = _fetch_shows(candidates, deadline=time.monotonic() + SEARCH_LOOKUP_WAIT_SECONDS)
+    return {show_id: _upcoming_or_none(show_id, result, now) for show_id, result in fetched.items()}
 
 
 @app.route(route="watchlist", methods=["GET"])
@@ -191,14 +282,37 @@ def watchlist_get(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(json.dumps(shows), status_code=200, mimetype="application/json")
 
 
+@app.route(route="watchlist/upcoming", methods=["GET"])
+@auth.require_session
+def watchlist_upcoming(req: func.HttpRequest) -> func.HttpResponse:
+    """GET /watchlist/upcoming -> [{"id", "status", "next_episodes"}] per watchlist show.
+
+    Separate from GET /watchlist so the list itself renders instantly; this
+    costs a TVMaze lookup per show (cached), and the page fills airdates in
+    when it arrives. Best-effort per show, like search: status and
+    next_episodes are null when that show's lookup failed or ran out of time.
+    """
+    show_ids = [show["id"] for show in storage.list_shows(auth.get_username(req))]
+    now = datetime.now(timezone.utc)
+    fetched = _fetch_shows(show_ids, deadline=time.monotonic() + WATCHLIST_LOOKUP_WAIT_SECONDS)
+
+    results = []
+    for show_id in show_ids:
+        result = fetched[show_id]
+        status = None if isinstance(result, Exception) else result[0].get("status")
+        results.append(
+            {"id": show_id, "status": status, "next_episodes": _upcoming_or_none(show_id, result, now)}
+        )
+    return func.HttpResponse(json.dumps(results), status_code=200, mimetype="application/json")
+
+
 @app.route(route="watchlist", methods=["POST"])
 @auth.require_session
 def watchlist_add(req: func.HttpRequest) -> func.HttpResponse:
     """POST /watchlist  body: {"show_id": int, "show_name": str} -> add to your watchlist."""
-    try:
-        body = req.get_json()
-    except ValueError:
-        return func.HttpResponse("Request body must be JSON.", status_code=400)
+    body = _json_object(req)
+    if body is None:
+        return func.HttpResponse("Request body must be a JSON object.", status_code=400)
 
     show_id = body.get("show_id")
     show_name = body.get("show_name")
@@ -234,6 +348,20 @@ def watchlist_feed_token(req: func.HttpRequest) -> func.HttpResponse:
     remove shows, so leaking it doesn't expose your account.
     """
     feed_token = storage.get_or_create_feed_token(auth.get_username(req))
+    return func.HttpResponse(
+        json.dumps({"feed_token": feed_token}), status_code=200, mimetype="application/json"
+    )
+
+
+@app.route(route="watchlist/feed-token/reset", methods=["POST"])
+@auth.require_session
+def watchlist_feed_token_reset(req: func.HttpRequest) -> func.HttpResponse:
+    """POST /watchlist/feed-token/reset -> {"feed_token": "..."}, a brand-new one.
+
+    The old calendar link stops working immediately -- the fix for a link
+    that leaked, at the cost of re-subscribing every calendar that used it.
+    """
+    feed_token = storage.reset_feed_token(auth.get_username(req))
     return func.HttpResponse(
         json.dumps({"feed_token": feed_token}), status_code=200, mimetype="application/json"
     )
@@ -292,20 +420,18 @@ def calendar_feed(req: func.HttpRequest) -> func.HttpResponse:
     # the platform's request timeout.
     shows_with_episodes = []
     transient_failures = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TVMAZE_FETCHES) as pool:
-        future_to_show_id = {pool.submit(get_show_with_episodes, show_id): show_id for show_id in show_ids}
-        for future in concurrent.futures.as_completed(future_to_show_id):
-            show_id = future_to_show_id[future]
-            try:
-                shows_with_episodes.append(future.result())
-            except TVMazeError:
-                # The show is genuinely gone from TVMaze. Skipping it is
-                # correct and permanent, not a blip -- one dead ID must not
-                # take down the rest of the feed.
-                logging.warning("Skipping unknown TVMaze show_id=%s", show_id)
-            except Exception:
-                logging.exception("TVMaze lookup failed for show_id=%s", show_id)
-                transient_failures += 1
+    fetched = _fetch_shows(show_ids, deadline=time.monotonic() + CALENDAR_LOOKUP_WAIT_SECONDS)
+    for show_id, result in fetched.items():
+        if isinstance(result, TVMazeError):
+            # The show is genuinely gone from TVMaze. Skipping it is
+            # correct and permanent, not a blip -- one dead ID must not
+            # take down the rest of the feed.
+            logging.warning("Skipping unknown TVMaze show_id=%s", show_id)
+        elif isinstance(result, Exception):
+            logging.error("TVMaze lookup failed for show_id=%s", show_id, exc_info=result)
+            transient_failures += 1
+        else:
+            shows_with_episodes.append(result)
 
     if transient_failures:
         # Never serve a partial feed as 200. Calendar apps treat a success
@@ -323,7 +449,10 @@ def calendar_feed(req: func.HttpRequest) -> func.HttpResponse:
             status_code=502,
         )
 
-    calendar = build_calendar(shows_with_episodes)
+    calendar = build_calendar(
+        shows_with_episodes,
+        since=datetime.now(timezone.utc) - timedelta(days=EPISODE_HISTORY_DAYS),
+    )
     return func.HttpResponse(
         calendar.to_ical(),
         status_code=200,

@@ -1,13 +1,12 @@
 """Watchlist and account persistence backed by Azure Table Storage.
 
 A "watchlist" has no identity of its own beyond its owning token: it is
-simply the set of show rows sharing a PartitionKey. That token is normally
-an account's (lowercased) username -- accounts are the unit of identity now
-(see auth.py), so signing in from any device reaches the same watchlist.
-The legacy shape (a random, client-generated token with no account behind
-it) still works structurally and is what migrate_watchlist() reads from
-when a browser's pre-account watchlist is folded into a new account at
-signup.
+simply the set of show rows sharing a PartitionKey. That token is an
+account's (lowercased) username -- accounts are the unit of identity (see
+auth.py), so signing in from any device reaches the same watchlist.
+Watchlists from before accounts existed are keyed by a random token
+instead; nothing can edit them anymore, but a calendar feed issued for one
+still resolves.
 
 The calendar feed uses a separate, server-issued *feed token*
 (get_or_create_feed_token / resolve_feed_token below) that can only be used
@@ -23,8 +22,9 @@ import re
 import secrets
 import threading
 
-from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
-from azure.data.tables import TableServiceClient
+from azure.core import MatchConditions
+from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
+from azure.data.tables import TableServiceClient, UpdateMode
 
 TABLE_NAME = "watchlistshows"
 MAX_WATCHLIST_SIZE = 100
@@ -187,6 +187,53 @@ def get_or_create_feed_token(list_token: str) -> str:
     return feed_token
 
 
+def reset_feed_token(list_token: str) -> str:
+    """Replace a watchlist's feed token with a new one and revoke the old one,
+    so a leaked calendar link stops working. Returns the new token."""
+    validate_token(list_token)
+    client = _table_client()
+    try:
+        meta = client.get_entity(partition_key=list_token, row_key=_META_ROW_KEY)
+    except ResourceNotFoundError:
+        meta = None
+
+    feed_token = secrets.token_urlsafe(24)
+    # Same ordering as get_or_create_feed_token: index row before the meta
+    # row that hands the token out, so a failure in between can't leave a
+    # link that never resolves.
+    _ensure_feed_index(client, feed_token, list_token)
+    new_meta = {"PartitionKey": list_token, "RowKey": _META_ROW_KEY, "FeedToken": feed_token}
+    try:
+        if meta is None:
+            client.create_entity(new_meta)
+        else:
+            # Conditional on the meta row we read. Two resets at once (two
+            # tabs) would otherwise both "win": the overwritten one's token
+            # would keep resolving, with no meta row pointing at it for a
+            # later reset to revoke.
+            client.update_entity(
+                new_meta,
+                mode=UpdateMode.REPLACE,
+                etag=meta.metadata["etag"],
+                match_condition=MatchConditions.IfNotModified,
+            )
+    except (ResourceExistsError, ResourceModifiedError):
+        # Lost to a concurrent reset: withdraw ours and use theirs.
+        _delete_feed_index(client, feed_token)
+        return client.get_entity(partition_key=list_token, row_key=_META_ROW_KEY)["FeedToken"]
+
+    if meta is not None:
+        _delete_feed_index(client, meta["FeedToken"])
+    return feed_token
+
+
+def _delete_feed_index(client, feed_token: str) -> None:
+    try:
+        client.delete_entity(partition_key=_FEED_INDEX_PARTITION, row_key=feed_token)
+    except ResourceNotFoundError:
+        pass
+
+
 def resolve_feed_token(feed_token: str) -> str:
     """Return the write token (watchlist) that a feed token was issued for."""
     validate_token(feed_token)
@@ -236,36 +283,3 @@ def get_account(username: str) -> dict:
         "salt": entity["Salt"],
         "iterations": entity["Iterations"],
     }
-
-
-def migrate_watchlist(old_token: str, new_username: str) -> None:
-    """Best-effort copy of shows from a pre-account watchlist token into an
-    account's watchlist (used once at signup to carry a browser's existing
-    list forward). Leaves the old rows in place rather than deleting them --
-    harmless, and safer if something goes wrong partway through.
-
-    `old_token` must NOT be a real account's username: since a username IS
-    a watchlist's PartitionKey, a naive copy would let anyone who knows (or
-    guesses) another user's username pass it as their own "previous_token"
-    at signup and silently copy that user's private watchlist into their
-    own account. This only ever migrates a genuinely anonymous, unclaimed
-    legacy token.
-    """
-    validate_token(old_token)
-    validate_token(new_username)
-    if old_token == new_username:
-        return
-
-    try:
-        get_account(old_token)
-    except UnknownAccount:
-        pass
-    else:
-        # old_token belongs to a real account -- refuse to touch it.
-        return
-
-    for show in list_shows(old_token):
-        try:
-            add_show(new_username, show["id"], show["name"])
-        except WatchlistFull:
-            break

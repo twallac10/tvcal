@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 
 import azure.functions as func
 
@@ -38,30 +40,6 @@ def test_auth_signup_creates_account_and_sets_cookie(monkeypatch):
 
     assert response.status_code == 204
     assert response.headers["Set-Cookie"] == "tvcal_session=alice; Path=/"
-
-
-def test_auth_signup_migrates_previous_token_when_given(monkeypatch):
-    monkeypatch.setattr(auth, "check_signup_code", lambda code: True)
-    monkeypatch.setattr(auth, "create_account", lambda username, password: "alice")
-    monkeypatch.setattr(auth, "create_session_cookie", lambda username: "tvcal_session=x; Path=/")
-
-    calls = []
-    monkeypatch.setattr(
-        storage, "migrate_watchlist", lambda old, new: calls.append((old, new))
-    )
-
-    body = json.dumps(
-        {
-            "username": "alice",
-            "password": "hunter2pass",
-            "signup_code": "letmein",
-            "previous_token": "old-browser-token",
-        }
-    ).encode()
-    response = function_app.auth_signup(_request("POST", "auth/signup", body=body))
-
-    assert response.status_code == 204
-    assert calls == [("old-browser-token", "alice")]
 
 
 def test_auth_signup_rejects_wrong_signup_code(monkeypatch):
@@ -427,12 +405,13 @@ def test_calendar_feed_rejects_unknown_feed_token(monkeypatch):
     assert response.status_code == 404
 
 
+# Airs in the future: the feed drops episodes older than EPISODE_HISTORY_DAYS.
 _PILOT_EPISODE = {
     "id": 1,
     "name": "Pilot",
     "season": 1,
     "number": 1,
-    "airstamp": "2008-09-09T20:00:00+00:00",
+    "airstamp": "2099-09-09T20:00:00+00:00",
     "summary": None,
 }
 
@@ -453,7 +432,7 @@ def test_calendar_feed_builds_events_from_feed_token(monkeypatch):
     monkeypatch.setattr(
         function_app,
         "get_show_with_episodes",
-        lambda show_id: ({"id": 82, "name": "Fringe", "runtime": 60}, [_PILOT_EPISODE]),
+        lambda show_id, deadline=None: ({"id": 82, "name": "Fringe", "runtime": 60}, [_PILOT_EPISODE]),
     )
 
     response = function_app.calendar_feed(_request("GET", "calendar.ics", params={"feed": feed_token}))
@@ -481,7 +460,7 @@ def test_calendar_feed_skips_a_broken_show_but_keeps_the_rest(monkeypatch):
         lambda token: [{"id": 999, "name": "Gone"}, {"id": 82, "name": "Fringe"}],
     )
 
-    def fake_get_show_with_episodes(show_id):
+    def fake_get_show_with_episodes(show_id, deadline=None):
         if show_id == 999:
             raise TVMazeError("gone")
         return {"id": 82, "name": "Fringe", "runtime": 60}, [_PILOT_EPISODE]
@@ -504,7 +483,7 @@ def test_calendar_feed_concurrent_fetch_isolates_multiple_failures(monkeypatch):
         lambda token: [{"id": i, "name": str(i)} for i in sorted(good_ids | bad_ids)],
     )
 
-    def fake_get_show_with_episodes(show_id):
+    def fake_get_show_with_episodes(show_id, deadline=None):
         if show_id in bad_ids:
             raise TVMazeError("gone")
         return {"id": show_id, "name": f"Show {show_id}", "runtime": 60}, [
@@ -532,7 +511,7 @@ def test_calendar_feed_refuses_to_serve_a_partial_feed_on_transient_failure(monk
         lambda token: [{"id": 82, "name": "Fringe"}, {"id": 143, "name": "Breaking Bad"}],
     )
 
-    def fake_get_show_with_episodes(show_id):
+    def fake_get_show_with_episodes(show_id, deadline=None):
         if show_id == 143:
             raise ConnectionError("TVMaze unreachable")
         return {"id": 82, "name": "Fringe", "runtime": 60}, [_PILOT_EPISODE]
@@ -554,7 +533,7 @@ def test_calendar_feed_still_skips_permanently_missing_shows(monkeypatch):
         lambda token: [{"id": 999, "name": "Gone"}, {"id": 82, "name": "Fringe"}],
     )
 
-    def fake_get_show_with_episodes(show_id):
+    def fake_get_show_with_episodes(show_id, deadline=None):
         if show_id == 999:
             raise TVMazeError("gone")
         return {"id": 82, "name": "Fringe", "runtime": 60}, [_PILOT_EPISODE]
@@ -602,7 +581,7 @@ def test_calendar_feed_ignores_the_removed_show_ids_param(monkeypatch):
     # out one TVMaze request per listed ID -- an amplification vector
     # guarding functionality nothing used. It must stay gone: without a
     # feed token, no caller reaches TVMaze through here at all.
-    def fail_if_called(show_id):
+    def fail_if_called(show_id, deadline=None):
         raise AssertionError("no TVMaze fetch should happen without a feed token")
 
     monkeypatch.setattr(function_app, "get_show_with_episodes", fail_if_called)
@@ -612,3 +591,302 @@ def test_calendar_feed_ignores_the_removed_show_ids_param(monkeypatch):
     )
 
     assert response.status_code == 400
+
+
+# -- search: upcoming episodes ---------------------------------------------
+
+_FUTURE = "2099-01-01T01:00:00+00:00"
+_PAST = "2000-01-01T01:00:00+00:00"
+
+
+def _tvmaze_show(show_id, name, status="Running", next_scheduled=True):
+    links = {"self": {"href": f"https://api.tvmaze.com/shows/{show_id}"}}
+    if next_scheduled:
+        links["nextepisode"] = {"href": "https://api.tvmaze.com/episodes/1"}
+    return {"id": show_id, "name": name, "status": status, "_links": links}
+
+
+def _search_body(response):
+    assert response.status_code == 200
+    return {result["id"]: result for result in json.loads(response.get_body())}
+
+
+def test_search_includes_next_episodes_for_shows_with_one_scheduled(monkeypatch):
+    monkeypatch.setattr(function_app, "search_shows", lambda q: [_tvmaze_show(82, "Fringe")])
+    monkeypatch.setattr(
+        function_app,
+        "get_show_with_episodes",
+        lambda show_id, deadline=None: (
+            {"id": show_id},
+            [
+                {"airstamp": _PAST, "season": 1, "number": 1},
+                {"airstamp": _FUTURE, "season": 6, "number": 1},
+            ],
+        ),
+    )
+
+    results = _search_body(function_app.search(_request("GET", "shows/search", params={"q": "fringe"})))
+
+    assert results[82]["next_episodes"] == [{"airstamp": _FUTURE, "airdate": None, "season": 6, "number": 1}]
+
+
+def test_search_skips_the_episode_fetch_when_nothing_is_scheduled(monkeypatch):
+    # Ended shows (and running shows between announcements) have no
+    # nextepisode link -- no point spending a TVMaze request on them.
+    monkeypatch.setattr(
+        function_app,
+        "search_shows",
+        lambda q: [_tvmaze_show(1, "Old Show", status="Ended", next_scheduled=False)],
+    )
+
+    def fail_if_called(show_id, deadline=None):
+        raise AssertionError("shouldn't fetch episodes for a show with nothing scheduled")
+
+    monkeypatch.setattr(function_app, "get_show_with_episodes", fail_if_called)
+
+    results = _search_body(function_app.search(_request("GET", "shows/search", params={"q": "old"})))
+
+    assert results[1]["next_episodes"] == []
+
+
+def test_search_still_succeeds_when_an_episode_lookup_fails(monkeypatch):
+    # Unlike the calendar feed, a search result missing its airdates is
+    # harmless -- report it as unknown (None, not "nothing scheduled") and
+    # keep the rest of the results.
+    monkeypatch.setattr(
+        function_app,
+        "search_shows",
+        lambda q: [_tvmaze_show(82, "Fringe"), _tvmaze_show(143, "Breaking Bad")],
+    )
+
+    def flaky_lookup(show_id, deadline=None):
+        if show_id == 143:
+            raise ConnectionError("TVMaze unreachable")
+        return {"id": show_id}, [{"airstamp": _FUTURE, "season": 1, "number": 2}]
+
+    monkeypatch.setattr(function_app, "get_show_with_episodes", flaky_lookup)
+
+    results = _search_body(function_app.search(_request("GET", "shows/search", params={"q": "x"})))
+
+    assert results[82]["next_episodes"] == [{"airstamp": _FUTURE, "airdate": None, "season": 1, "number": 2}]
+    assert results[143]["next_episodes"] is None
+
+
+# -- malformed bodies --------------------------------------------------------
+
+
+def test_json_bodies_that_arent_objects_are_rejected_not_500ed(monkeypatch):
+    monkeypatch.setattr(auth, "check_signup_code", lambda code: True)
+    for handler, route in [
+        (function_app.auth_signup, "auth/signup"),
+        (function_app.auth_login, "auth/login"),
+        (function_app.watchlist_add, "watchlist"),
+    ]:
+        for body in (b'["a list"]', b'"a string"', b"42", b"null"):
+            response = handler(_request("POST", route, body=body))
+            assert response.status_code == 400, (route, body)
+
+
+def test_auth_signup_rejects_a_non_ascii_signup_code_cleanly(monkeypatch):
+    # hmac.compare_digest raises on non-ASCII str -- an invite code typed
+    # with an iPhone smart dash must be refused, not 500.
+    monkeypatch.setenv("SIGNUP_CODE", "abc-def")
+    body = json.dumps(
+        {"username": "alice", "password": "a-real-password", "signup_code": "abc—def"}
+    ).encode()
+
+    response = function_app.auth_signup(_request("POST", "auth/signup", body=body))
+
+    assert response.status_code == 401
+
+
+# -- watchlist airdates ------------------------------------------------------
+
+
+def test_watchlist_upcoming_reports_each_shows_next_episodes(monkeypatch):
+    monkeypatch.setattr(
+        storage,
+        "list_shows",
+        lambda token: [{"id": 82, "name": "Fringe"}, {"id": 143, "name": "Severance"}],
+    )
+
+    def fake_lookup(show_id, deadline=None):
+        if show_id == 82:
+            return {"id": 82, "status": "Ended"}, [{"airstamp": _PAST, "season": 5, "number": 13}]
+        return {"id": 143, "status": "Running"}, [{"airstamp": _FUTURE, "season": 3, "number": 1}]
+
+    monkeypatch.setattr(function_app, "get_show_with_episodes", fake_lookup)
+
+    response = function_app.watchlist_upcoming(_request("GET", "watchlist/upcoming"))
+
+    assert response.status_code == 200
+    assert json.loads(response.get_body()) == [
+        {"id": 82, "status": "Ended", "next_episodes": []},
+        {"id": 143, "status": "Running", "next_episodes": [{"airstamp": _FUTURE, "airdate": None, "season": 3, "number": 1}]},
+    ]
+
+
+def test_watchlist_upcoming_reports_a_failed_lookup_as_unknown(monkeypatch):
+    monkeypatch.setattr(storage, "list_shows", lambda token: [{"id": 82, "name": "Fringe"}])
+
+    def busy(show_id, deadline=None):
+        raise function_app.TVMazeBusy("rate limited")
+
+    monkeypatch.setattr(function_app, "get_show_with_episodes", busy)
+
+    response = function_app.watchlist_upcoming(_request("GET", "watchlist/upcoming"))
+
+    assert json.loads(response.get_body()) == [{"id": 82, "status": None, "next_episodes": None}]
+
+
+def _hanging_lookup(slow_show_id, release):
+    """A get_show_with_episodes fake where one show hangs until `release`."""
+
+    def lookup(show_id, deadline=None):
+        if show_id == slow_show_id:
+            release.wait(5)
+        return {"id": show_id, "name": str(show_id), "status": "Running"}, [
+            {"airstamp": _FUTURE, "season": 1, "number": 1}
+        ]
+
+    return lookup
+
+
+def test_search_answers_within_its_budget_even_if_a_lookup_hangs(monkeypatch):
+    # The budget has to bound the whole wait, not just rate-limit waits: a
+    # slow TVMaze download used to hold up the entire search.
+    release = threading.Event()
+    monkeypatch.setattr(function_app, "SEARCH_LOOKUP_WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(
+        function_app, "search_shows", lambda q: [_tvmaze_show(82, "Fringe"), _tvmaze_show(143, "Slow")]
+    )
+    monkeypatch.setattr(function_app, "get_show_with_episodes", _hanging_lookup(143, release))
+    try:
+        started = time.monotonic()
+        results = _search_body(function_app.search(_request("GET", "shows/search", params={"q": "x"})))
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+
+    assert elapsed < 1
+    assert results[82]["next_episodes"]  # the prompt one still has its airdates
+    assert results[143]["next_episodes"] is None
+
+
+def test_watchlist_upcoming_answers_within_its_budget_even_if_a_lookup_hangs(monkeypatch):
+    release = threading.Event()
+    monkeypatch.setattr(function_app, "WATCHLIST_LOOKUP_WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(
+        storage, "list_shows", lambda token: [{"id": 82, "name": "Fringe"}, {"id": 143, "name": "Slow"}]
+    )
+    monkeypatch.setattr(function_app, "get_show_with_episodes", _hanging_lookup(143, release))
+    try:
+        started = time.monotonic()
+        response = function_app.watchlist_upcoming(_request("GET", "watchlist/upcoming"))
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+
+    body = {show["id"]: show for show in json.loads(response.get_body())}
+    assert elapsed < 1
+    assert body[82]["next_episodes"]
+    assert body[143] == {"id": 143, "status": None, "next_episodes": None}
+
+
+def test_calendar_feed_refuses_a_partial_feed_when_a_lookup_runs_out_of_time(monkeypatch):
+    release = threading.Event()
+    feed_token = _use_feed_token(monkeypatch)
+    monkeypatch.setattr(function_app, "CALENDAR_LOOKUP_WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(
+        storage, "list_shows", lambda token: [{"id": 82, "name": "Fringe"}, {"id": 143, "name": "Slow"}]
+    )
+    monkeypatch.setattr(function_app, "get_show_with_episodes", _hanging_lookup(143, release))
+    try:
+        started = time.monotonic()
+        response = function_app.calendar_feed(_request("GET", "calendar.ics", params={"feed": feed_token}))
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+
+    assert elapsed < 1
+    assert response.status_code == 502
+
+
+# -- calendar link reset -----------------------------------------------------
+
+
+def test_feed_token_reset_returns_the_new_token_for_the_signed_in_user(monkeypatch):
+    calls = []
+
+    def fake_reset(username):
+        calls.append(username)
+        return "new-feed-tok"
+
+    monkeypatch.setattr(storage, "reset_feed_token", fake_reset)
+
+    response = function_app.watchlist_feed_token_reset(_request("POST", "watchlist/feed-token/reset"))
+
+    assert response.status_code == 200
+    assert json.loads(response.get_body()) == {"feed_token": "new-feed-tok"}
+    assert calls == ["testuser"]
+
+
+def test_new_routes_return_401_without_a_session(monkeypatch):
+    monkeypatch.setattr(auth, "is_authenticated", lambda req: False)
+
+    assert function_app.watchlist_upcoming(_request("GET", "watchlist/upcoming")).status_code == 401
+    assert (
+        function_app.watchlist_feed_token_reset(_request("POST", "watchlist/feed-token/reset")).status_code
+        == 401
+    )
+
+
+# -- calendar name -----------------------------------------------------------
+
+
+def test_calendar_feed_name_does_not_reveal_the_username(monkeypatch):
+    # A feed link is meant to be safe to leak (read-only, no login). Naming
+    # the calendar after the account would hand out half the login with it.
+    feed_token = _use_feed_token(monkeypatch, write_token="alice")
+    monkeypatch.setattr(storage, "list_shows", lambda token: [])
+
+    body = function_app.calendar_feed(_request("GET", "calendar.ics", params={"feed": feed_token})).get_body()
+
+    assert b"X-WR-CALNAME:TV Cal\r\n" in body
+    assert b"alice" not in body
+
+
+def test_calendar_feed_drops_long_past_episodes(monkeypatch):
+    feed_token = _use_feed_token(monkeypatch)
+    monkeypatch.setattr(storage, "list_shows", lambda token: [{"id": 82, "name": "Fringe"}])
+    monkeypatch.setattr(
+        function_app,
+        "get_show_with_episodes",
+        lambda show_id, deadline=None: (
+            {"id": 82, "name": "Fringe"},
+            [{**_PILOT_EPISODE, "id": 1, "airstamp": _PAST}, {**_PILOT_EPISODE, "id": 2}],
+        ),
+    )
+
+    body = function_app.calendar_feed(_request("GET", "calendar.ics", params={"feed": feed_token})).get_body()
+
+    assert b"tvmaze-episode-1@tvcal" not in body
+    assert b"tvmaze-episode-2@tvcal" in body
+
+
+def test_calendar_feed_lookups_share_one_overall_time_budget(monkeypatch):
+    feed_token = _use_feed_token(monkeypatch)
+    monkeypatch.setattr(
+        storage, "list_shows", lambda token: [{"id": 82, "name": "Fringe"}, {"id": 143, "name": "Severance"}]
+    )
+    deadlines = set()
+
+    def record_deadline(show_id, deadline=None):
+        deadlines.add(deadline)
+        return {"id": show_id, "name": str(show_id)}, []
+
+    monkeypatch.setattr(function_app, "get_show_with_episodes", record_deadline)
+
+    function_app.calendar_feed(_request("GET", "calendar.ics", params={"feed": feed_token}))
+
+    assert len(deadlines) == 1 and None not in deadlines

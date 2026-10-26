@@ -167,21 +167,3 @@ def test_signups_are_closed_when_no_signup_code_is_configured(fake_client, monke
     ).encode()
 
     assert function_app.auth_signup(_request("POST", "auth/signup", body=body)).status_code == 403
-
-
-def test_signup_cannot_steal_another_accounts_watchlist_via_previous_token(fake_client):
-    _signup("alice")
-    _add_show(_cookie_for("alice"), 82, "Fringe")
-
-    body = json.dumps(
-        {
-            "username": "mallory",
-            "password": PASSWORD,
-            "signup_code": SIGNUP_CODE,
-            "previous_token": "alice",
-        }
-    ).encode()
-    assert function_app.auth_signup(_request("POST", "auth/signup", body=body)).status_code == 204
-
-    assert _get_watchlist(_cookie_for("mallory")) == (200, [])
-    assert _get_watchlist(_cookie_for("alice")) == (200, [{"id": 82, "name": "Fringe"}])
