@@ -68,14 +68,11 @@ def index(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="auth/signup", methods=["POST"])
 def auth_signup(req: func.HttpRequest) -> func.HttpResponse:
-    """POST /auth/signup  body: {"username", "password", "signup_code", "previous_token"?}.
+    """POST /auth/signup  body: {"username", "password", "signup_code"}.
 
     signup_code gates account creation (see the SIGNUP_CODE app setting) --
     it's shared out-of-band with whoever should get an account, same trust
     model as the old shared password, but only for this one step.
-    previous_token, if given, is a pre-account browser's watchlist token
-    (localStorage) to fold into the new account -- best-effort, ignored if
-    missing/invalid so it never blocks signup itself.
     """
     body = _json_object(req)
     if body is None:
@@ -84,7 +81,6 @@ def auth_signup(req: func.HttpRequest) -> func.HttpResponse:
     username = body.get("username")
     password = body.get("password")
     signup_code = body.get("signup_code")
-    previous_token = body.get("previous_token")
 
     if (
         not isinstance(username, str)
@@ -120,12 +116,6 @@ def auth_signup(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(str(exc), status_code=409)
     except storage.TooManyAccounts as exc:
         return func.HttpResponse(str(exc), status_code=403)
-
-    if isinstance(previous_token, str) and previous_token:
-        try:
-            storage.migrate_watchlist(previous_token, normalized_username)
-        except storage.InvalidListToken:
-            pass  # stale/malformed previous_token -- signup still succeeds
 
     try:
         cookie = auth.create_session_cookie(normalized_username)

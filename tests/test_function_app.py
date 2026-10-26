@@ -40,30 +40,6 @@ def test_auth_signup_creates_account_and_sets_cookie(monkeypatch):
     assert response.headers["Set-Cookie"] == "tvcal_session=alice; Path=/"
 
 
-def test_auth_signup_migrates_previous_token_when_given(monkeypatch):
-    monkeypatch.setattr(auth, "check_signup_code", lambda code: True)
-    monkeypatch.setattr(auth, "create_account", lambda username, password: "alice")
-    monkeypatch.setattr(auth, "create_session_cookie", lambda username: "tvcal_session=x; Path=/")
-
-    calls = []
-    monkeypatch.setattr(
-        storage, "migrate_watchlist", lambda old, new: calls.append((old, new))
-    )
-
-    body = json.dumps(
-        {
-            "username": "alice",
-            "password": "hunter2pass",
-            "signup_code": "letmein",
-            "previous_token": "old-browser-token",
-        }
-    ).encode()
-    response = function_app.auth_signup(_request("POST", "auth/signup", body=body))
-
-    assert response.status_code == 204
-    assert calls == [("old-browser-token", "alice")]
-
-
 def test_auth_signup_rejects_wrong_signup_code(monkeypatch):
     monkeypatch.setattr(auth, "check_signup_code", lambda code: False)
 

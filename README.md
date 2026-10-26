@@ -23,10 +23,7 @@ that. Share the code with whoever should get an account, then consider
 rotating/blanking `SIGNUP_CODE` once everyone who needs one has signed up.
 
 A session cookie (HttpOnly, 30 days) keeps you signed in after that, with a
-"Log out" button to end it early. If your browser already has a watchlist
-under the old pre-account scheme (a `tvcal_list_token` in localStorage from
-before you had an account), signing up automatically folds those shows into
-your new account, once — nothing is lost.
+"Log out" button to end it early.
 
 **What this deliberately doesn't have**, since it's a two-person app: no
 password change, no password reset, and no per-account session revocation.
@@ -66,13 +63,9 @@ stop updating and need re-subscribing).
 Every endpoint below except `/`, `/auth/*`, and `/calendar.ics` requires a
 valid session cookie (see **Signing in**).
 
-- `POST /auth/signup` — body `{"username", "password", "signup_code", "previous_token"?}`.
+- `POST /auth/signup` — body `{"username", "password", "signup_code"}`.
   Creates an account (`password` must be 8+ characters, `username` 3-50
-  characters of letters/digits/`-`/`_`) and signs you in. `previous_token`
-  is optional — a pre-account browser's `tvcal_list_token`, folded into the
-  new account if given. It's silently ignored (no shows copied, signup
-  still succeeds) if it matches another real account's username, so it
-  can't be used to pull someone else's watchlist into your new account.
+  characters of letters/digits/`-`/`_`) and signs you in.
   `409` if the username's taken, `401` for a wrong `signup_code`, `403`
   once `MAX_ACCOUNTS` is reached or if no `SIGNUP_CODE` is configured at
   all (signups closed). Passwords are capped at 1024 characters — these

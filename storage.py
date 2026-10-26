@@ -1,13 +1,12 @@
 """Watchlist and account persistence backed by Azure Table Storage.
 
 A "watchlist" has no identity of its own beyond its owning token: it is
-simply the set of show rows sharing a PartitionKey. That token is normally
-an account's (lowercased) username -- accounts are the unit of identity now
-(see auth.py), so signing in from any device reaches the same watchlist.
-The legacy shape (a random, client-generated token with no account behind
-it) still works structurally and is what migrate_watchlist() reads from
-when a browser's pre-account watchlist is folded into a new account at
-signup.
+simply the set of show rows sharing a PartitionKey. That token is an
+account's (lowercased) username -- accounts are the unit of identity (see
+auth.py), so signing in from any device reaches the same watchlist.
+Watchlists from before accounts existed are keyed by a random token
+instead; nothing can edit them anymore, but a calendar feed issued for one
+still resolves.
 
 The calendar feed uses a separate, server-issued *feed token*
 (get_or_create_feed_token / resolve_feed_token below) that can only be used
@@ -260,36 +259,3 @@ def get_account(username: str) -> dict:
         "salt": entity["Salt"],
         "iterations": entity["Iterations"],
     }
-
-
-def migrate_watchlist(old_token: str, new_username: str) -> None:
-    """Best-effort copy of shows from a pre-account watchlist token into an
-    account's watchlist (used once at signup to carry a browser's existing
-    list forward). Leaves the old rows in place rather than deleting them --
-    harmless, and safer if something goes wrong partway through.
-
-    `old_token` must NOT be a real account's username: since a username IS
-    a watchlist's PartitionKey, a naive copy would let anyone who knows (or
-    guesses) another user's username pass it as their own "previous_token"
-    at signup and silently copy that user's private watchlist into their
-    own account. This only ever migrates a genuinely anonymous, unclaimed
-    legacy token.
-    """
-    validate_token(old_token)
-    validate_token(new_username)
-    if old_token == new_username:
-        return
-
-    try:
-        get_account(old_token)
-    except UnknownAccount:
-        pass
-    else:
-        # old_token belongs to a real account -- refuse to touch it.
-        return
-
-    for show in list_shows(old_token):
-        try:
-            add_show(new_username, show["id"], show["name"])
-        except WatchlistFull:
-            break

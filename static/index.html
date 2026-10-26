@@ -841,19 +841,13 @@
     const password = document.getElementById("signup-password").value;
     const signupCode = document.getElementById("signup-code").value;
 
-    // A pre-account browser may already have a watchlist under the old
-    // localStorage-token scheme -- fold it into the new account, once.
-    const previousToken = localStorage.getItem("tvcal_list_token") || undefined;
-
     const res = await postAuth(event.target, "/auth/signup", {
       username,
       password,
       signup_code: signupCode,
-      previous_token: previousToken,
     }, "Creating account…");
 
     if (res.ok) {
-      localStorage.removeItem("tvcal_list_token");
       document.getElementById("signup-password").value = "";
       document.getElementById("signup-code").value = "";
       state.username = username.toLowerCase();

@@ -173,70 +173,6 @@ def test_accounts_partition_does_not_collide_with_a_same_named_watchlist(fake_cl
     }
 
 
-# -- migrate_watchlist ------------------------------------------------------
-
-
-def test_migrate_watchlist_copies_shows_to_new_owner(fake_client):
-    storage.add_show("old-token-abc", 82, "Fringe")
-    storage.add_show("old-token-abc", 143, "Breaking Bad")
-
-    storage.migrate_watchlist("old-token-abc", "alice")
-
-    assert storage.list_shows("alice") == [
-        {"id": 143, "name": "Breaking Bad"},
-        {"id": 82, "name": "Fringe"},
-    ]
-
-
-def test_migrate_watchlist_leaves_old_rows_in_place(fake_client):
-    storage.add_show("old-token-abc", 82, "Fringe")
-
-    storage.migrate_watchlist("old-token-abc", "alice")
-
-    assert storage.list_shows("old-token-abc") == [{"id": 82, "name": "Fringe"}]
-
-
-def test_migrate_watchlist_merges_into_an_existing_watchlist(fake_client):
-    storage.add_show("old-token-abc", 82, "Fringe")
-    storage.add_show("alice", 143, "Breaking Bad")
-
-    storage.migrate_watchlist("old-token-abc", "alice")
-
-    assert storage.list_shows("alice") == [
-        {"id": 143, "name": "Breaking Bad"},
-        {"id": 82, "name": "Fringe"},
-    ]
-
-
-def test_migrate_watchlist_is_a_noop_when_tokens_match(fake_client):
-    storage.add_show("alice", 82, "Fringe")
-    storage.migrate_watchlist("alice", "alice")
-    assert storage.list_shows("alice") == [{"id": 82, "name": "Fringe"}]
-
-
-def test_migrate_watchlist_stops_at_the_watchlist_cap(fake_client, monkeypatch):
-    storage.add_show("old-token-abc", 82, "Fringe")
-    storage.add_show("old-token-abc", 143, "Breaking Bad")
-
-    monkeypatch.setattr(storage, "MAX_WATCHLIST_SIZE", 1)
-    storage.migrate_watchlist("old-token-abc", "alice")
-
-    assert len(storage.list_shows("alice")) == 1
-
-
-def test_migrate_watchlist_refuses_to_copy_from_a_real_account(fake_client):
-    # A username IS a watchlist's PartitionKey now -- migrate_watchlist must
-    # never let someone pass another real account's username as their own
-    # "previous_token" at signup and walk off with that account's shows.
-    storage.create_account("bob", "hash", "salt", 600_000)
-    storage.add_show("bob", 1, "Bob's Private Show")
-
-    storage.migrate_watchlist("bob", "attacker")
-
-    assert storage.list_shows("attacker") == []
-    assert storage.list_shows("bob") == [{"id": 1, "name": "Bob's Private Show"}]
-
-
 def test_feed_token_survives_a_failure_between_its_two_writes(fake_client):
     # The meta row and the index row are two separate, non-atomic writes.
     # If the second one fails (transient Table Storage error, instance
@@ -299,10 +235,6 @@ def test_reserved_tokens_are_rejected_everywhere(fake_client, reserved):
         storage.add_show(reserved, 1, "Show")
     with pytest.raises(storage.InvalidListToken):
         storage.create_account(reserved, "hash", "salt", 600_000)
-    with pytest.raises(storage.InvalidListToken):
-        storage.migrate_watchlist(reserved, "alice")
-    with pytest.raises(storage.InvalidListToken):
-        storage.migrate_watchlist("some-legacy-token", reserved)
 
 
 def test_reset_feed_token_revokes_the_old_link(fake_client):
