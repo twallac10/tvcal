@@ -81,25 +81,37 @@ valid session cookie (see **Signing in**).
 
 ### `GET /shows/search?q=<name>`
 
-Search TVMaze for shows by name.
+Search TVMaze for shows by name, including each show's next two upcoming
+episodes.
 
 ```
-GET /shows/search?q=fringe
+GET /shows/search?q=traitors
 ```
 
 ```json
 [
   {
-    "id": 82,
-    "name": "Fringe",
-    "premiered": "2008-09-09",
-    "status": "Ended",
-    "network": "FOX",
-    "image": "https://static.tvmaze.com/uploads/images/medium_portrait/0/2400.jpg",
-    "summary": "<p>...</p>"
+    "id": 59434,
+    "name": "The Traitors",
+    "premiered": "2023-01-12",
+    "status": "Running",
+    "network": "Peacock",
+    "image": "https://static.tvmaze.com/uploads/images/medium_portrait/...jpg",
+    "summary": "<p>...</p>",
+    "next_episodes": [
+      {"airstamp": "2026-10-30T01:00:00+00:00", "season": 4, "number": 2},
+      {"airstamp": "2026-11-06T01:00:00+00:00", "season": 4, "number": 3}
+    ]
   }
 ]
 ```
+
+TVMaze's search doesn't include episodes, so `next_episodes` costs one
+extra TVMaze request per result. Those requests run concurrently, and only
+for shows TVMaze reports as having a next episode scheduled, which skips
+ended shows. `next_episodes` is `[]` when nothing is scheduled and `null`
+when the lookup failed. A failed lookup only blanks that one show's
+airdates; the search itself still succeeds.
 
 ### `GET /watchlist`
 

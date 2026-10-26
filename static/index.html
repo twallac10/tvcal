@@ -84,9 +84,18 @@
   .empty { color: var(--text-muted); margin: 0; }
   #search-results {
     display: grid;
+    /* minmax(0, ...) so a long unwrapped line truncates inside its card
+       instead of widening the column past the section's padding. */
+    grid-template-columns: minmax(0, 1fr);
     gap: 10px;
-    margin-top: 14px;
   }
+  #home-link { color: inherit; text-decoration: none; }
+  .results-header { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+  .results-header h2 { margin: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Airdate lines wrap rather than truncate -- on a phone the episode code
+     is exactly what an ellipsis would cut off. */
+  .show-info p.airdate { white-space: normal; }
+  .show-info p.airdate.upcoming { color: var(--text); }
   .show-card {
     display: flex;
     align-items: center;
@@ -139,7 +148,7 @@
 <body>
 <main>
   <header>
-    <h1>TV Cal</h1>
+    <h1><a href="/" id="home-link">TV Cal</a></h1>
     <p>Search TV shows, build a watchlist, subscribe to one calendar feed.</p>
   </header>
 
@@ -176,27 +185,39 @@
         <input type="search" id="search-input" placeholder="Search by title..." autocomplete="off" required>
         <button type="submit">Search</button>
       </form>
+    </section>
+
+    <section id="results-view" hidden>
+      <div class="results-header">
+        <button type="button" id="back-btn" class="secondary">← Back</button>
+        <h2 id="results-heading"></h2>
+      </div>
       <div id="search-results"></div>
     </section>
 
-    <section id="watchlist">
-      <h2>My watchlist</h2>
-      <ul id="watchlist-items"></ul>
-    </section>
+    <div id="home-view">
+      <section id="watchlist">
+        <h2>My watchlist</h2>
+        <ul id="watchlist-items"></ul>
+      </section>
 
-    <section id="feed">
-      <h2>Calendar subscription</h2>
-      <div class="feed-row">
-        <input type="text" id="feed-url" readonly>
-        <button type="button" id="copy-btn" class="secondary">Copy</button>
-      </div>
-      <p class="hint">Paste this URL into Google Calendar, Apple Calendar, or Outlook as a subscription (not a one-time import). It always reflects your current watchlist. This link is read-only -- anyone who has it can see your episode schedule but can't change your watchlist.</p>
-    </section>
+      <section id="feed">
+        <h2>Calendar subscription</h2>
+        <div class="feed-row">
+          <input type="text" id="feed-url" readonly>
+          <button type="button" id="copy-btn" class="secondary">Copy</button>
+        </div>
+        <p class="hint">Paste this URL into Google Calendar, Apple Calendar, or Outlook as a subscription (not a one-time import). It always reflects your current watchlist. This link is read-only -- anyone who has it can see your episode schedule but can't change your watchlist.</p>
+      </section>
+    </div>
   </div>
 </main>
 
 <script>
-  const state = { username: null, feedToken: null, watchlist: [] };
+  // searchSeq lets a slow search response notice it's been superseded (by
+  // a newer search, or by going home) and drop itself instead of
+  // overwriting what's on screen.
+  const state = { username: null, feedToken: null, watchlist: [], searchSeq: 0 };
 
   async function apiFetch(url, options) {
     const res = await fetch(url, options);
@@ -225,6 +246,7 @@
     state.username = null;
     state.feedToken = null;
     state.watchlist = [];
+    showHomeView();
 
     document.getElementById("login-section").hidden = false;
     document.getElementById("app-section").hidden = true;
@@ -238,7 +260,52 @@
       ? `Signed in as ${state.username}`
       : "";
     loadWatchlist();
+
+    // A reload (or re-login) while on a results page stays on it.
+    if (history.state && history.state.view === "results") {
+      search(history.state.query, { updateHistory: false });
+    } else {
+      showHomeView();
+    }
   }
+
+  // -- views: home (watchlist + calendar) vs search results -------------
+  //
+  // A results view gets its own browser-history entry, so the phone's back
+  // gesture (or the browser's Back) returns home instead of leaving the
+  // site. Searching again from results replaces that entry rather than
+  // stacking a new one, so Back always goes straight home.
+
+  function showHomeView() {
+    state.searchSeq++;
+    document.getElementById("results-view").hidden = true;
+    document.getElementById("home-view").hidden = false;
+    document.getElementById("search-results").innerHTML = "";
+    document.getElementById("search-input").value = "";
+  }
+
+  function showResultsView(query) {
+    document.getElementById("results-heading").textContent = `Results for “${query}”`;
+    document.getElementById("home-view").hidden = true;
+    document.getElementById("results-view").hidden = false;
+  }
+
+  function goHome() {
+    if (history.state && history.state.view === "results") {
+      history.back(); // the popstate handler below finishes the job
+    } else {
+      showHomeView();
+    }
+  }
+
+  window.addEventListener("popstate", (event) => {
+    if (document.getElementById("app-section").hidden) return;
+    if (event.state && event.state.view === "results") {
+      search(event.state.query, { updateHistory: false });
+    } else {
+      showHomeView();
+    }
+  });
 
   async function checkAuthAndInit() {
     const res = await fetch("/auth/status");
@@ -318,26 +385,89 @@
     }
   }
 
-  async function search(query) {
+  async function search(query, { updateHistory = true } = {}) {
+    const seq = ++state.searchSeq;
+
+    if (updateHistory) {
+      const entry = { view: "results", query };
+      if (history.state && history.state.view === "results") {
+        history.replaceState(entry, "");
+      } else {
+        history.pushState(entry, "");
+      }
+    }
+
+    document.getElementById("search-input").value = query;
+    showResultsView(query);
+    renderSearchMessage("Searching…");
+
     const res = await apiFetch(`/shows/search?q=${encodeURIComponent(query)}`);
-    renderResults(res.ok ? await res.json() : []);
+    if (seq !== state.searchSeq) return; // superseded while in flight
+    if (res.status === 401) return; // apiFetch already showed the login form
+
+    if (!res.ok) {
+      renderSearchMessage("Couldn't reach TVMaze. Try again in a moment.");
+      return;
+    }
+    renderResults(await res.json());
+  }
+
+  function renderSearchMessage(text) {
+    const container = document.getElementById("search-results");
+    container.innerHTML = "";
+    const message = document.createElement("p");
+    message.className = "empty";
+    message.textContent = text;
+    container.appendChild(message);
   }
 
   function renderResults(results) {
-    const container = document.getElementById("search-results");
-    container.innerHTML = "";
-
     if (results.length === 0) {
-      const empty = document.createElement("p");
-      empty.className = "empty";
-      empty.textContent = "No matches.";
-      container.appendChild(empty);
+      renderSearchMessage("No matches.");
       return;
     }
 
+    const container = document.getElementById("search-results");
+    container.innerHTML = "";
     for (const show of results) {
       container.appendChild(buildShowCard(show));
     }
+  }
+
+  function formatAirdate(airstamp) {
+    const date = new Date(airstamp);
+    const options = { weekday: "short", month: "short", day: "numeric" };
+    if (date.getFullYear() !== new Date().getFullYear()) {
+      options.year = "numeric";
+    }
+    return date.toLocaleDateString(undefined, options);
+  }
+
+  function formatEpisodeCode(episode) {
+    const pad = (n) => String(n).padStart(2, "0");
+    return Number.isInteger(episode.season) && Number.isInteger(episode.number)
+      ? `S${pad(episode.season)}E${pad(episode.number)}`
+      : "";
+  }
+
+  // Dates only, no times: for streaming releases TVMaze's hour is often a
+  // best guess, but the day is reliable.
+  function airdateLines(show) {
+    const episodes = show.next_episodes;
+    if (episodes === null || episodes === undefined) {
+      return []; // lookup failed -- say nothing rather than something wrong
+    }
+    if (episodes.length === 0) {
+      return [{ text: show.status === "Ended" ? "Ended" : "No upcoming episodes announced", upcoming: false }];
+    }
+    // Non-breaking spaces keep the date and "· S01E02" each in one piece,
+    // so on a narrow phone the line wraps between them, not mid-date.
+    const nbsp = (text) => text.replace(/ /g, " ");
+    return episodes.map((episode, index) => {
+      const code = formatEpisodeCode(episode);
+      const date = `${index === 0 ? "Next:" : "Then:"} ${nbsp(formatAirdate(episode.airstamp))}`;
+      return { text: code ? `${date} · ${code}` : date, upcoming: true };
+    });
   }
 
   function buildShowCard(show) {
@@ -364,26 +494,41 @@
     meta.textContent = [show.network, year].filter(Boolean).join(" · ");
     info.appendChild(meta);
 
+    for (const line of airdateLines(show)) {
+      const p = document.createElement("p");
+      p.className = line.upcoming ? "airdate upcoming" : "airdate";
+      p.textContent = line.text;
+      info.appendChild(p);
+    }
+
     card.appendChild(info);
 
     const button = document.createElement("button");
-    const added = isInWatchlist(show.id);
-    button.disabled = added;
-    button.textContent = added ? "Added" : "+ Add";
+    renderWatchlistToggle(button, show.id);
     button.addEventListener("click", async () => {
+      const removing = isInWatchlist(show.id);
       button.disabled = true;
-      button.textContent = "Adding…";
-      const ok = await addShow(show.id, show.name);
-      if (ok) {
-        button.textContent = "Added";
+      button.textContent = removing ? "Removing…" : "Adding…";
+      if (removing) {
+        await removeShow(show.id);
       } else {
-        button.disabled = false;
-        button.textContent = "+ Add";
+        await addShow(show.id, show.name);
       }
+      // Re-derive from the reloaded watchlist rather than assuming the
+      // request did what was asked -- a failed add or remove just leaves
+      // the button showing the true state, ready to retry.
+      renderWatchlistToggle(button, show.id);
     });
     card.appendChild(button);
 
     return card;
+  }
+
+  function renderWatchlistToggle(button, showId) {
+    const added = isInWatchlist(showId);
+    button.disabled = false;
+    button.textContent = added ? "Remove" : "+ Add";
+    button.className = added ? "remove-btn" : "";
   }
 
   async function addShow(id, name) {
@@ -395,18 +540,26 @@
     if (res.ok) {
       await loadWatchlist();
     }
-    return res.ok;
   }
 
   async function removeShow(id) {
-    await apiFetch(`/watchlist/${id}`, { method: "DELETE" });
-    await loadWatchlist();
+    const res = await apiFetch(`/watchlist/${id}`, { method: "DELETE" });
+    if (res.ok) {
+      await loadWatchlist();
+    }
   }
 
   document.getElementById("search-form").addEventListener("submit", (event) => {
     event.preventDefault();
     const query = document.getElementById("search-input").value.trim();
     if (query) search(query);
+  });
+
+  document.getElementById("back-btn").addEventListener("click", goHome);
+
+  document.getElementById("home-link").addEventListener("click", (event) => {
+    event.preventDefault();
+    goHome();
   });
 
   document.getElementById("copy-btn").addEventListener("click", async () => {

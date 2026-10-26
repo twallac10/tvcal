@@ -612,3 +612,82 @@ def test_calendar_feed_ignores_the_removed_show_ids_param(monkeypatch):
     )
 
     assert response.status_code == 400
+
+
+# -- search: upcoming episodes ---------------------------------------------
+
+_FUTURE = "2099-01-01T01:00:00+00:00"
+_PAST = "2000-01-01T01:00:00+00:00"
+
+
+def _tvmaze_show(show_id, name, status="Running", next_scheduled=True):
+    links = {"self": {"href": f"https://api.tvmaze.com/shows/{show_id}"}}
+    if next_scheduled:
+        links["nextepisode"] = {"href": "https://api.tvmaze.com/episodes/1"}
+    return {"id": show_id, "name": name, "status": status, "_links": links}
+
+
+def _search_body(response):
+    assert response.status_code == 200
+    return {result["id"]: result for result in json.loads(response.get_body())}
+
+
+def test_search_includes_next_episodes_for_shows_with_one_scheduled(monkeypatch):
+    monkeypatch.setattr(function_app, "search_shows", lambda q: [_tvmaze_show(82, "Fringe")])
+    monkeypatch.setattr(
+        function_app,
+        "get_show_with_episodes",
+        lambda show_id: (
+            {"id": show_id},
+            [
+                {"airstamp": _PAST, "season": 1, "number": 1},
+                {"airstamp": _FUTURE, "season": 6, "number": 1},
+            ],
+        ),
+    )
+
+    results = _search_body(function_app.search(_request("GET", "shows/search", params={"q": "fringe"})))
+
+    assert results[82]["next_episodes"] == [{"airstamp": _FUTURE, "season": 6, "number": 1}]
+
+
+def test_search_skips_the_episode_fetch_when_nothing_is_scheduled(monkeypatch):
+    # Ended shows (and running shows between announcements) have no
+    # nextepisode link -- no point spending a TVMaze request on them.
+    monkeypatch.setattr(
+        function_app,
+        "search_shows",
+        lambda q: [_tvmaze_show(1, "Old Show", status="Ended", next_scheduled=False)],
+    )
+
+    def fail_if_called(show_id):
+        raise AssertionError("shouldn't fetch episodes for a show with nothing scheduled")
+
+    monkeypatch.setattr(function_app, "get_show_with_episodes", fail_if_called)
+
+    results = _search_body(function_app.search(_request("GET", "shows/search", params={"q": "old"})))
+
+    assert results[1]["next_episodes"] == []
+
+
+def test_search_still_succeeds_when_an_episode_lookup_fails(monkeypatch):
+    # Unlike the calendar feed, a search result missing its airdates is
+    # harmless -- report it as unknown (None, not "nothing scheduled") and
+    # keep the rest of the results.
+    monkeypatch.setattr(
+        function_app,
+        "search_shows",
+        lambda q: [_tvmaze_show(82, "Fringe"), _tvmaze_show(143, "Breaking Bad")],
+    )
+
+    def flaky_lookup(show_id):
+        if show_id == 143:
+            raise ConnectionError("TVMaze unreachable")
+        return {"id": show_id}, [{"airstamp": _FUTURE, "season": 1, "number": 2}]
+
+    monkeypatch.setattr(function_app, "get_show_with_episodes", flaky_lookup)
+
+    results = _search_body(function_app.search(_request("GET", "shows/search", params={"q": "x"})))
+
+    assert results[82]["next_episodes"] == [{"airstamp": _FUTURE, "season": 1, "number": 2}]
+    assert results[143]["next_episodes"] is None

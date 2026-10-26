@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 
 import requests
 
@@ -55,3 +56,42 @@ def get_show_with_episodes(show_id: int) -> tuple[dict, list[dict]]:
     show = response.json()
     episodes = show.pop("_embedded", {}).get("episodes", [])
     return show, episodes
+
+
+def _int_or_none(value) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def upcoming_episodes(episodes, now: datetime, limit: int = 2) -> list[dict]:
+    """The next `limit` episodes airing after `now`, soonest first.
+
+    TVMaze data is untrusted input, so anything malformed (a non-list, a
+    non-dict episode, a missing or unparseable airstamp) is skipped rather
+    than raised -- this feeds search results, where one odd show shouldn't
+    break the page.
+    """
+    if not isinstance(episodes, list):
+        return []
+
+    upcoming = []
+    for episode in episodes:
+        if not isinstance(episode, dict) or not isinstance(episode.get("airstamp"), str):
+            continue
+        try:
+            airs_at = datetime.fromisoformat(episode["airstamp"])
+        except ValueError:
+            continue
+        if airs_at.tzinfo is None:
+            airs_at = airs_at.replace(tzinfo=timezone.utc)
+        if airs_at > now:
+            upcoming.append((airs_at, episode))
+
+    upcoming.sort(key=lambda pair: pair[0])
+    return [
+        {
+            "airstamp": airs_at.isoformat(),
+            "season": _int_or_none(episode.get("season")),
+            "number": _int_or_none(episode.get("number")),
+        }
+        for airs_at, episode in upcoming[:limit]
+    ]

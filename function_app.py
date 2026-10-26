@@ -3,13 +3,14 @@ import concurrent.futures
 import json
 import logging
 import pathlib
+from datetime import datetime, timezone
 
 import azure.functions as func
 
 import auth
 import storage
 from ical_builder import build_calendar
-from tvmaze_client import TVMazeError, get_show_with_episodes, search_shows
+from tvmaze_client import TVMazeError, get_show_with_episodes, search_shows, upcoming_episodes
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
@@ -157,7 +158,7 @@ def auth_status(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="shows/search", methods=["GET"])
 @auth.require_session
 def search(req: func.HttpRequest) -> func.HttpResponse:
-    """GET /shows/search?q=<name> -> matching shows with their TVMaze IDs."""
+    """GET /shows/search?q=<name> -> matching shows, with their next episodes."""
     query = req.params.get("q")
     if not query:
         return func.HttpResponse("Query parameter 'q' is required.", status_code=400)
@@ -180,7 +181,50 @@ def search(req: func.HttpRequest) -> func.HttpResponse:
         logging.exception("TVMaze search failed for query=%s", query)
         return func.HttpResponse("Failed to reach TVMaze.", status_code=502)
 
+    next_episodes = _next_episodes_by_show(shows)
+    for result in results:
+        result["next_episodes"] = next_episodes.get(result["id"], [])
+
     return func.HttpResponse(json.dumps(results), status_code=200, mimetype="application/json")
+
+
+def _might_have_upcoming_episodes(show: dict) -> bool:
+    # TVMaze only includes a nextepisode link when one is actually
+    # scheduled, so this skips the extra fetch for ended shows and for
+    # running shows between announcements.
+    links = show.get("_links")
+    if isinstance(links, dict):
+        return "nextepisode" in links
+    return show.get("status") != "Ended"
+
+
+def _next_episodes_by_show(shows: list[dict]) -> dict:
+    """Best-effort upcoming-episode lookup for each search result.
+
+    Search results don't include episodes, so this costs one TVMaze request
+    per candidate show, made concurrently. A failed lookup maps to None
+    ("unknown"), not [] ("nothing scheduled"), and never fails the search
+    itself -- unlike the calendar feed, a search result missing an airdate
+    is harmless.
+    """
+    candidates = [show["id"] for show in shows if _might_have_upcoming_episodes(show)]
+    found = {}
+    if not candidates:
+        return found
+
+    now = datetime.now(timezone.utc)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TVMAZE_FETCHES) as pool:
+        future_to_show_id = {pool.submit(get_show_with_episodes, show_id): show_id for show_id in candidates}
+        for future in concurrent.futures.as_completed(future_to_show_id):
+            show_id = future_to_show_id[future]
+            try:
+                _, episodes = future.result()
+            except Exception:
+                logging.warning("Couldn't look up upcoming episodes for show_id=%s", show_id, exc_info=True)
+                found[show_id] = None
+                continue
+            found[show_id] = upcoming_episodes(episodes, now)
+    return found
 
 
 @app.route(route="watchlist", methods=["GET"])

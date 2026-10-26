@@ -1,7 +1,9 @@
+from datetime import datetime, timezone
+
 import pytest
 
 import tvmaze_client
-from tvmaze_client import TVMazeError, get_show_with_episodes, search_shows
+from tvmaze_client import TVMazeError, get_show_with_episodes, search_shows, upcoming_episodes
 
 BASE_URL = "https://api.tvmaze.com"
 
@@ -71,3 +73,53 @@ def test_persistent_rate_limiting_eventually_raises(requests_mock):
 
     with pytest.raises(Exception):
         get_show_with_episodes(82)
+
+
+# -- upcoming_episodes ----------------------------------------------------
+
+NOW = datetime(2026, 10, 26, 12, 0, tzinfo=timezone.utc)
+
+
+def _ep(airstamp, season=1, number=1):
+    return {"airstamp": airstamp, "season": season, "number": number}
+
+
+def test_upcoming_episodes_returns_the_next_two_soonest_first():
+    episodes = [
+        _ep("2026-11-09T01:00:00+00:00", 2, 3),
+        _ep("2026-10-01T01:00:00+00:00", 1, 9),  # already aired
+        _ep("2026-11-02T01:00:00+00:00", 2, 2),
+        _ep("2026-10-27T01:00:00+00:00", 2, 1),
+    ]
+
+    assert upcoming_episodes(episodes, NOW) == [
+        {"airstamp": "2026-10-27T01:00:00+00:00", "season": 2, "number": 1},
+        {"airstamp": "2026-11-02T01:00:00+00:00", "season": 2, "number": 2},
+    ]
+
+
+def test_upcoming_episodes_is_empty_when_everything_has_aired():
+    assert upcoming_episodes([_ep("2020-01-01T00:00:00+00:00")], NOW) == []
+
+
+def test_upcoming_episodes_treats_a_naive_airstamp_as_utc():
+    assert upcoming_episodes([_ep("2026-10-27T01:00:00")], NOW) == [
+        {"airstamp": "2026-10-27T01:00:00+00:00", "season": 1, "number": 1}
+    ]
+
+
+def test_upcoming_episodes_skips_malformed_data_instead_of_raising():
+    episodes = [
+        "not a dict",
+        {"no": "airstamp"},
+        {"airstamp": None},
+        {"airstamp": "not-a-date"},
+        _ep("2026-10-27T01:00:00+00:00", season="1", number=True),
+    ]
+
+    # The one usable episode survives; its non-int season/number are
+    # dropped rather than passed through to the UI.
+    assert upcoming_episodes(episodes, NOW) == [
+        {"airstamp": "2026-10-27T01:00:00+00:00", "season": None, "number": None}
+    ]
+    assert upcoming_episodes("not a list", NOW) == []
